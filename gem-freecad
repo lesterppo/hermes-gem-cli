@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""
+gem-freecad — automated pipeline: Gemini Gem → FreeCAD → STL → render
+
+Usage:
+  gem-freecad <gem-url> "build a tower"                    # full pipeline
+  gem-freecad <gem-url> -m pro --thinking extended "..."   # with model options
+  gem-freecad <gem-url> --review "improve the base"        # review existing STL
+  gem-freecad <gem-url> --no-render "quick build"          # skip rendering
+
+Output: STL, decimated STL, PNG renders, geometry stats JSON
+"""
+
+import subprocess, sys, json, os, base64, pathlib
+from pathlib import Path
+from datetime import datetime
+
+GEM_CLI = os.path.expanduser("~/.local/bin/gem-cli")
+FREECAD = "freecadcmd"
+DECIMATE = os.path.expanduser("~/.hermes/skills/software-development/freecad/scripts/decimate_stl.py")
+
+def run(cmd, **kw):
+    """Run a command, return (stdout, stderr, returncode)."""
+    r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    return r.stdout.strip(), r.stderr.strip(), r.returncode
+
+def fail(msg):
+    print(json.dumps({"ok": False, "err": msg}))
+    sys.exit(1)
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(0)
+    
+    # Parse: gem-freecad <gem-url> [gem-cli-flags...] "prompt" [--pipeline-flags]
+    gem_url = args[0]
+    prompt = None
+    gem_flags = []
+    review_mode = False
+    no_render = False
+    out_name = None
+    
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a == "--review":
+            review_mode = True
+        elif a == "--no-render":
+            no_render = True
+        elif a == "-o":
+            i += 1
+            out_name = args[i]
+        elif a.startswith("-"):
+            gem_flags.extend([a])
+            if a in ("-m", "--model", "--thinking", "-t", "--timeout", "-c", "--conversation", "-o", "--output", "-i", "--image", "-f", "--file", "--resume"):
+                i += 1
+                gem_flags.append(args[i])
+        else:
+            prompt = a
+        i += 1
+    
+    if not prompt and not review_mode:
+        fail("No prompt provided")
+    
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    work_dir = Path(f"/tmp/gem-freecad-{ts}")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    build_script = work_dir / "build.py"
+    stl_file = work_dir / "model.stl"
+    stl_dec = work_dir / "model_dec.stl"
+    stats_file = work_dir / "stats.json"
+    
+    print(f"[pipeline] work dir: {work_dir}", file=sys.stderr)
+    
+    # Step 1: Get FreeCAD script from Gem
+    if not review_mode:
+        print("[pipeline] 1/4: Generating FreeCAD script...", file=sys.stderr)
+        cmd = [GEM_CLI, gem_url, "--extract-code", "1", "-o", str(build_script), "--raw"] + gem_flags + [prompt]
+        out, err, rc = run(cmd, timeout=300)
+        if rc != 0:
+            fail(f"gem-cli failed: {err or out}")
+        result = json.loads(out)
+        if not result.get("ok"):
+            fail(f"gem-cli: {result}")
+        print(f"[pipeline]   script: {build_script} ({result['s']} bytes, lang={result['lang']})", file=sys.stderr)
+    
+    # Step 2: Build with FreeCAD
+    if build_script.exists():
+        print("[pipeline] 2/4: Building with FreeCAD...", file=sys.stderr)
+        # Fix common Gem API mistakes in the script
+        code = build_script.read_text()
+        code = code.replace("Part.Wire(Part.makePolygon(", "Part.makePolygon(")
+        code = code.replace(").translated(", ").translate(")
+        code = code.replace('").translated(', '").translate(')
+        # Fix stale guard
+        code = code.replace('MARKER = f"/tmp/_fc_guard_{os.getpid()}"',
+                          f'MARKER = "/tmp/_fc_guard_pipeline"')
+        code = code.replace('if os.path.exists(MARKER): sys.exit(0)', '')
+        code = code.replace('open(MARKER, "w").close()', '')
+        # Fix export path
+        code = code.replace('/tmp/skytree_v4.stl', str(stl_file))
+        code = code.replace('/tmp/skytree_v3.stl', str(stl_file))
+        code = code.replace('/tmp/skytree_v2.stl', str(stl_file))
+        code = code.replace('/tmp/skytree.stl', str(stl_file))
+        code = code.replace('"/tmp/skytree', f'"{stl_file}')
+        # Add guard at top
+        code = 'import os, sys\nif os.path.exists("/tmp/_fc_guard_pipeline"): sys.exit(0)\nopen("/tmp/_fc_guard_pipeline", "w").close()\n' + code
+        build_script.write_text(code)
+        
+        out, err, rc = run([FREECAD, str(build_script)], timeout=120)
+        if rc != 0 or not stl_file.exists():
+            fail(f"FreeCAD failed: {err[-500:] if err else 'no STL produced'}")
+        size_kb = stl_file.stat().st_size / 1024
+        print(f"[pipeline]   STL: {stl_file} ({size_kb:.0f} KB)", file=sys.stderr)
+    
+    # Step 3: Decimate + stats
+    if stl_file.exists():
+        print("[pipeline] 3/4: Decimating + computing stats...", file=sys.stderr)
+        
+        # Decimate
+        if Path(DECIMATE).exists():
+            run([sys.executable, DECIMATE, str(stl_file), str(stl_dec)], timeout=30)
+        
+        # Geometry stats via numpy-stl
+        try:
+            from stl import mesh
+            import numpy as np
+            m = mesh.Mesh.from_file(str(stl_file))
+            all_v = m.vectors.reshape(-1, 3)
+            stats = {
+                "faces": len(m.vectors),
+                "bounds": {
+                    "x": [float(all_v[:,0].min()), float(all_v[:,0].max())],
+                    "y": [float(all_v[:,1].min()), float(all_v[:,1].max())],
+                    "z": [float(all_v[:,2].min()), float(all_v[:,2].max())],
+                },
+                "height": float(all_v[:,2].max() - all_v[:,2].min()),
+                "center": [float(all_v.mean(0)[0]), float(all_v.mean(0)[1]), float(all_v.mean(0)[2])],
+            }
+            dec_faces = len(mesh.Mesh.from_file(str(stl_dec)).vectors) if stl_dec.exists() else 0
+            stats["decimated_faces"] = dec_faces
+            stats["stl_kb"] = round(stl_file.stat().st_size / 1024, 1)
+            if stl_dec.exists():
+                stats["decimated_kb"] = round(stl_dec.stat().st_size / 1024, 1)
+            stats_file.write_text(json.dumps(stats, indent=2))
+            print(f"[pipeline]   Stats: {stats['faces']:,} faces, height={stats['height']:.0f}mm, bounds={[f'{v:.0f}' for v in stats['bounds']['z']]}", file=sys.stderr)
+        except ImportError:
+            print("[pipeline]   numpy-stl not available, skipping stats", file=sys.stderr)
+    
+    # Step 4: Render previews
+    if not no_render and stl_file.exists():
+        print("[pipeline] 4/4: Rendering previews...", file=sys.stderr)
+        try:
+            import numpy as np
+            from stl import mesh as stl_mesh
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+            
+            src = stl_dec if stl_dec.exists() else stl_file
+            m = stl_mesh.Mesh.from_file(str(src))
+            v = m.vectors
+            all_v = v.reshape(-1, 3)
+            xl, xu = all_v[:,0].min()-5, all_v[:,0].max()+5
+            yl, yu = all_v[:,1].min()-5, all_v[:,1].max()+5
+            zl, zu = all_v[:,2].min()-5, all_v[:,2].max()+5
+            
+            views = [
+                (work_dir / "front.png", 15, -90),
+                (work_dir / "iso.png", 25, -45),
+                (work_dir / "top.png", 80, -90),
+            ]
+            for path, elev, azim in views:
+                fig = plt.figure(figsize=(10, 12), facecolor='#1a1a2e')
+                ax = fig.add_subplot(111, projection='3d')
+                ax.set_facecolor('#1a1a2e')
+                ax.add_collection3d(Poly3DCollection(v, alpha=0.95, lw=0.05, ec='#555', fc='#ccc'))
+                ax.set_xlim(xl,xu); ax.set_ylim(yl,yu); ax.set_zlim(zl,zu)
+                ax.set_box_aspect((xu-xl, yu-yl, zu-zl))
+                ax.view_init(elev=elev, azim=azim)
+                ax.set_axis_off(); ax.grid(False)
+                plt.tight_layout(pad=0)
+                plt.savefig(path, dpi=150, bbox_inches='tight', pad_inches=0.1, facecolor='#1a1a2e')
+                plt.close()
+            print(f"[pipeline]   Renders: {work_dir}/{{front,iso,top}}.png", file=sys.stderr)
+        except ImportError:
+            print("[pipeline]   matplotlib/numpy-stl not available, skipping renders", file=sys.stderr)
+    
+    # Summary
+    print(json.dumps({
+        "ok": True,
+        "work_dir": str(work_dir),
+        "stl": str(stl_file) if stl_file.exists() else None,
+        "stl_dec": str(stl_dec) if stl_dec.exists() else None,
+        "stats": str(stats_file) if stats_file.exists() else None,
+        "renders": [str(work_dir / f"{n}.png") for n in ["front","iso","top"]] if (work_dir / "front.png").exists() else [],
+        "faces": json.loads(stats_file.read_text()).get("faces") if stats_file.exists() else None,
+    }))
+
+
+if __name__ == "__main__":
+    main()

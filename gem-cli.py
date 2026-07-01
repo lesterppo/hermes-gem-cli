@@ -488,6 +488,10 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                             help="Extract & cache auth tokens from browser, then exit")
         parser.add_argument("--login", action="store_true",
                             help="Open browser for interactive Gemini login")
+        parser.add_argument("--create-gem", type=str, dest="create_gem_name", metavar="NAME",
+                            help="Create a new Gem with system prompt from stdin or -p")
+        parser.add_argument("--delete-gem", type=str, dest="delete_gem_id", metavar="ID",
+                            help="Delete a Gem by ID")
         parser.add_argument("--gem-info", action="store_true", dest="gem_info",
                             help="Fetch Gem metadata (name, description) and exit")
         parser.add_argument("--clear", action="store_true", dest="clear_conv",
@@ -502,6 +506,14 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                             help="Max seconds for generation (default: 120)")
         parser.add_argument("--no-retry", action="store_true",
                             help="Disable auto-retry on auth error")
+        parser.add_argument("--extract-code", type=int, dest="extract_code", metavar="N",
+                            help="Save Nth code block from response to file and exit "
+                            "(1-indexed, use with -o to specify output file)")
+        parser.add_argument("--resume", type=str, dest="resume_session", metavar="ID",
+                            help="Resume conversation by session ID (cid) without needing -c file. "
+                            "Use with -c to save state for future turns.")
+        parser.add_argument("--timeout-soft", type=int, dest="timeout_soft", metavar="SEC",
+                            help="Warn at N seconds but keep waiting (for slow Pro calls)")
         args = parser.parse_args()
 
         self.raw_mode = args.raw_mode or args.quiet
@@ -512,7 +524,8 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             _loguru.logger.add(sys.stderr, level="CRITICAL")  # effectively silent
 
         # ── Standalone discovery commands ──
-        standalone = args.init or args.login or args.list_models or args.list_gems
+        standalone = args.init or args.login or args.list_models or args.list_gems \
+                     or args.create_gem_name or args.delete_gem_id
         if standalone and not args.url:
             args.url = "setup"  # dummy for auth resolution
 
@@ -539,6 +552,47 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 print(json.dumps({"ok": True, "action": "login", "cached": str(AUTH_CACHE)}))
             else:
                 fail("LOGIN_FAILED", "Login timed out. Try again or set GEMINI_SID/GEMINI_TS.")
+            return
+
+        # ── Handle --create-gem ──
+        if args.create_gem_name:
+            # Read system prompt from stdin or -p
+            if args.prompt:
+                system_prompt = " ".join(args.prompt)
+            elif not sys.stdin.isatty():
+                system_prompt = sys.stdin.read().strip()
+            else:
+                fail("NO_PROMPT", "Provide system prompt via stdin or positional args.")
+            sid, ts = resolve_auth(
+                preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"),
+                allow_login=False)
+            try:
+                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                await client.init()
+                gem = await client.create_gem(
+                    name=args.create_gem_name,
+                    prompt=system_prompt,
+                    description=f"Hermes task-specific Gem: {args.create_gem_name}",
+                )
+                print(json.dumps({"ok": True, "action": "create-gem",
+                                  "id": gem.id, "name": gem.name}))
+            except Exception as e:
+                fail("GEM_CREATE_FAILED", str(e))
+            return
+
+        # ── Handle --delete-gem ──
+        if args.delete_gem_id:
+            sid, ts = resolve_auth(
+                preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"),
+                allow_login=False)
+            try:
+                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                await client.init()
+                await client.delete_gem(args.delete_gem_id)
+                print(json.dumps({"ok": True, "action": "delete-gem",
+                                  "id": args.delete_gem_id}))
+            except Exception as e:
+                fail("GEM_DELETE_FAILED", str(e))
             return
 
         # ── Handle --clear ──
@@ -617,9 +671,6 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         if args.brief and prompt and not prompt.lower().startswith("be concise"):
             prompt = "Be concise. " + prompt
 
-        if not args.image_gen and prompt and looks_like_image_gen(prompt):
-            args.image_gen = True
-
         # ── 5-tier auth ──
         sid, ts = resolve_auth(
             preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"),
@@ -690,7 +741,18 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         # ── Conversation state ──
         conv_state = None
         chat_metadata = None
-        if args.conversation:
+        if args.resume_session:
+            # Resume by session ID without needing a -c file
+            conv_state = {
+                "cid": args.resume_session,
+                "metadata": [args.resume_session, ""],
+                "turns": 0,
+                "created": datetime.now(timezone.utc).isoformat(),
+            }
+            chat_metadata = conv_state["metadata"]
+            if not self.raw_mode:
+                self.log(f"Resuming session {args.resume_session}")
+        elif args.conversation:
             if not args.new_conv:
                 conv_state = load_conv(args.conversation)
                 if conv_state:
@@ -855,6 +917,22 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 out_path.write_text(out_text, encoding="utf-8")
 
             code_blocks = self.parse_code_blocks(text)
+            
+            if args.extract_code:
+                # --extract-code N: save just the Nth code block
+                n = args.extract_code
+                if n < 1 or n > len(code_blocks):
+                    fail("BAD_CODE_INDEX", f"Code block {n} not found. Response has {len(code_blocks)} code blocks.")
+                cb = code_blocks[n - 1]
+                code_text = cb["code"]
+                out_path = Path(args.output) if args.output else \
+                           Path(f"/tmp/gem-cli-code-{n}.{cb['lang'] or 'txt'}")
+                out_path.write_text(code_text, encoding="utf-8")
+                print(json.dumps({"ok": True, "action": "extract-code", "n": n,
+                                  "lang": cb["lang"] or "text", "f": self._short_path(out_path),
+                                  "s": out_path.stat().st_size}))
+                return
+            
             self.pointer(out_path, conv_state, images_out, len(code_blocks),
                         model_label=model_label, gem_name=gem_name,
                         deep_research=args.deep_research)
