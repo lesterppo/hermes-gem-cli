@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+auth.json
+.gemini-cli/
+.env
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
