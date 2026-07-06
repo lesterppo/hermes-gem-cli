@@ -488,8 +488,10 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                             help="Extract & cache auth tokens from browser, then exit")
         parser.add_argument("--login", action="store_true",
                             help="Open browser for interactive Gemini login")
+        parser.add_argument("-p", "--prompt-flag", type=str, dest="prompt_flag",
+                            help="Prompt text (alternative to positional or stdin)")
         parser.add_argument("--create-gem", type=str, dest="create_gem_name", metavar="NAME",
-                            help="Create a new Gem with system prompt from stdin or -p")
+                            help="Create a new Gem with system prompt from stdin, -p, or positional args")
         parser.add_argument("--delete-gem", type=str, dest="delete_gem_id", metavar="ID",
                             help="Delete a Gem by ID")
         parser.add_argument("--gem-info", action="store_true", dest="gem_info",
@@ -514,7 +516,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                             "Use with -c to save state for future turns.")
         parser.add_argument("--timeout-soft", type=int, dest="timeout_soft", metavar="SEC",
                             help="Warn at N seconds but keep waiting (for slow Pro calls)")
-        args = parser.parse_args()
+        args = parser.parse_intermixed_args()
 
         self.raw_mode = args.raw_mode or args.quiet
 
@@ -556,13 +558,15 @@ Output: compact JSON pointer on stdout, full response on disk.""")
 
         # ── Handle --create-gem ──
         if args.create_gem_name:
-            # Read system prompt from stdin or -p
-            if args.prompt:
+            # Read system prompt from stdin, -p, or positional args
+            if args.prompt_flag:
+                system_prompt = args.prompt_flag
+            elif args.prompt:
                 system_prompt = " ".join(args.prompt)
             elif not sys.stdin.isatty():
                 system_prompt = sys.stdin.read().strip()
             else:
-                fail("NO_PROMPT", "Provide system prompt via stdin or positional args.")
+                fail("NO_PROMPT", "Provide system prompt via -p, stdin, or positional args.")
             sid, ts = resolve_auth(
                 preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"),
                 allow_login=False)
@@ -655,6 +659,8 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         if args.image_prompt:
             prompt = f"Generate an image: {args.image_prompt}"
             args.image_gen = True
+        elif args.prompt_flag:
+            prompt = args.prompt_flag
         elif args.prompt:
             prompt = " ".join(args.prompt)
         elif args.list_models or args.list_gems:
