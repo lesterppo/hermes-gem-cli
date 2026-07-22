@@ -15,33 +15,56 @@ import asyncio, argparse, json, os, re, sys, time, webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── Patch: skip hanging gemini-webapi init (curl_cffi blocks on WSL) ──
-def _apply_init_patch():
+# ── WSL2 fix: curl_cffi hangs → urllib-based session ──────────
+# Replaces gemini-webapi's curl_cffi AsyncSession with urllib.
+# SNlM0e is dead (Jul 2026); tokens fetched from gemini.google.com/app.
+def _wsl2_init_fix():
     try:
-        from gemini_webapi import GeminiClient
-        from curl_cffi.requests import AsyncSession
-        async def _p(self, timeout=450, auto_close=False, close_delay=450,
-                      auto_refresh=True, refresh_interval=600, watchdog_timeout=120,
-                      verbose=False):
-            import random as _r
-            async with self._lock:
-                if self._running: return
-                self.verbose = verbose
-                self.watchdog_timeout = watchdog_timeout
-                s = AsyncSession(impersonate="chrome", timeout=timeout)
-                for c in self._cookies.jar:
-                    s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
-                self.client = s
-                self.access_token = self.build_label = self.session_id = None
-                self.language = "en"; self.push_id = "feeds/mcudyrk2a4khkz"
-                self._running = True; self._reqid = _r.randint(10000, 99999)
-                self.timeout = timeout
-                self.auto_close = auto_close; self.close_delay = close_delay
-                self.auto_refresh = auto_refresh
-                self.refresh_interval = refresh_interval
-        GeminiClient.init = _p
-    except Exception: pass
-_apply_init_patch()
+        import json, os, re, urllib.request, urllib.parse, random as _random
+        from pathlib import Path
+
+        # Import urllib session wrapper
+        _here = Path(__file__).resolve().parent
+        if str(_here) not in __import__("sys").path:
+            __import__("sys").path.insert(0, str(_here))
+        from urllib_session import UrllibSession
+
+        import gemini_webapi.utils.get_access_token as _gat
+
+        async def _patched_get_access_token(base_cookies, proxy=None, verbose=False, verify=True):
+            s = UrllibSession(impersonate="chrome", timeout=30)
+            if isinstance(base_cookies, dict):
+                for k, v in base_cookies.items():
+                    if v: s.cookies.set(k, v, domain=".google.com")
+            else:
+                try:
+                    for c in base_cookies.jar:
+                        s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+                except Exception:
+                    for k, v in dict(base_cookies).items():
+                        if v: s.cookies.set(k, v, domain=".google.com")
+            try:
+                r = await s.get("https://gemini.google.com/app")
+                html = r.text
+                bl = (re.search(r'"cfb2h":\s*"(.*?)"', html) or [None,None])[1]
+                sid = (re.search(r'"FdrFJe":\s*"(.*?)"', html) or [None,None])[1]
+                lang = (re.search(r'"TuX5cc":\s*"(.*?)"', html) or [None,None])[1]
+                pid = (re.search(r'"qKIAYe":\s*"(.*?)"', html) or [None,None])[1]
+                return (None, bl, sid, lang, pid or "feeds/mcudyrk2a4khkz", s)
+            except Exception:
+                return (None, None, None, None, None, s)
+
+        _gat.get_access_token = _patched_get_access_token
+        # Also patch the client module's reference (the one init() actually calls)
+        try:
+            import gemini_webapi.client as _client_mod
+            _client_mod.get_access_token = _patched_get_access_token
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+_wsl2_init_fix()
 
 # ── Dependencies ─────────────────────────────────────────────
 
@@ -563,8 +586,10 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             try:
                 client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
                 await client.init()
-                chats = await client.list_chats()
-                chat_list = [{"cid": c.cid, "title": c.title, "updated": c.updated}
+                chats = client.list_chats()
+                if chats is None:
+                    fail("LIST_CHATS_FAILED", "No recent chats available (session not initialized).")
+                chat_list = [{"cid": c.cid, "title": c.title, "updated": getattr(c, 'updated', '')}
                              for c in chats[:args.limit]]
                 print(json.dumps({"ok": True, "chats": chat_list, "total": len(chat_list)}))
             except Exception as e:
@@ -624,7 +649,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             prompt = args.prompt_flag
         elif args.prompt:
             prompt = " ".join(args.prompt)
-        elif args.list_models or args.list_gems:
+        elif args.list_models or args.list_gems or args.gem_info:
             prompt = ""
         elif not sys.stdin.isatty():
             prompt = sys.stdin.read().strip()
