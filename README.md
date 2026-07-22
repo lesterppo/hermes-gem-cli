@@ -80,6 +80,29 @@ gem-cli "<GEM_ID>" -m pro --deep-research "complex research question"
 - Firefox or Chrome signed into gemini.google.com
 - Dependencies: `gemini-webapi`, `browser-cookie3`, `loguru`
 
+## Architecture — gemini-webapi vs gem-pw
+
+**gemini-webapi** (Python library) provides the `GeminiClient` for direct HTTP
+calls to Google's internal API. However, as of July 2026, Google's
+`batchexecute` and `StreamGenerate` POST endpoints are **browser-gated** —
+they silently drop connections from non-browser HTTP clients (curl, urllib,
+curl_cffi — tested on WSL2, Windows, and native Linux). GET requests
+(token extraction) work; POST requests (chat, Gem CRUD, discovery) hang
+indefinitely.
+
+**gem-pw** (browser automation) drives a real Chromium browser via Playwright.
+This is the only working path for Gem chat, create, edit, delete, image gen,
+and deep research. The browser sends real TLS fingerprints and HTTP/2 headers
+that Google accepts.
+
+`gemini.py` routes operations as follows:
+- `--init`, `--list-models`, `--list-gems`: gemini-webapi (GET works)
+- Chat, Gem CRUD, image gen, deep research: gem-pw fallback
+- `--list-chats`, `--account-status`: gemini-webapi (when available)
+
+When POST operations are blocked, the tool automatically falls back to
+`gem-pw` (if installed) — no API key, no payment needed.
+
 ## Privacy
 
 This tool runs entirely on your machine. No data is sent anywhere except to Google's Gemini API (same as using gemini.google.com in your browser). Auth tokens are cached locally at `~/.gemini-cli/auth.json`.
