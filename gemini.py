@@ -15,6 +15,55 @@ import asyncio, argparse, json, os, re, sys, time, webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+# ── Patch gemini-webapi: bypass hanging get_access_token (Jul 2026) ──
+# curl_cffi's AsyncSession.get() hangs on WSL for gemini.google.com.
+# SNlM0e access token is dead; skip the hanging call, return stub values.
+
+def _apply_init_patch():
+    """Monkey-patch GeminiClient.init to skip all hanging network calls.
+    curl_cffi's AsyncSession blocks indefinitely on WSL for Gemini endpoints.
+    SNlM0e is dead (Jul 2026). _init_rpc hangs on _fetch_user_status.
+    Skip everything — return a bare-minimum initialized client."""
+    try:
+        from gemini_webapi import GeminiClient
+        from curl_cffi.requests import AsyncSession, Cookies
+
+        async def _patched_init(self, timeout=450, auto_close=False,
+                                close_delay=450, auto_refresh=True,
+                                refresh_interval=600, watchdog_timeout=120,
+                                verbose=False):
+            import random as _random
+            async with self._lock:
+                if self._running:
+                    return
+                self.verbose = verbose
+                self.watchdog_timeout = watchdog_timeout
+                session = AsyncSession(impersonate="chrome", timeout=timeout)
+                for cookie in self._cookies.jar:
+                    session.cookies.set(
+                        cookie.name, cookie.value,
+                        domain=cookie.domain, path=cookie.path)
+                self.client = session
+                self.access_token = None
+                self.build_label = None
+                self.session_id = None
+                self.language = "en"
+                self.push_id = "feeds/mcudyrk2a4khkz"
+                self._running = True
+                self._reqid = _random.randint(10000, 99999)
+                self.timeout = timeout
+                self.auto_close = auto_close
+                self.close_delay = close_delay
+                self.auto_refresh = auto_refresh
+                self.refresh_interval = refresh_interval
+
+        GeminiClient.init = _patched_init
+    except Exception:
+        pass
+
+_apply_init_patch()
+
 # ── Dependencies ─────────────────────────────────────────────
 
 try:
