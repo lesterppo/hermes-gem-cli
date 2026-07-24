@@ -15,8 +15,17 @@ import asyncio, argparse, json, os, re, sys, time, webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── WSL2 fix: curl_cffi hangs → urllib-based session ──────────
-# Replaces gemini-webapi's curl_cffi AsyncSession with urllib.
+# ── WSL2 fix: curl_cffi hangs on WSL2 → urllib-based session ──
+# On WSL2, curl_cffi's async requests hang indefinitely. Native Linux
+# and GitHub Actions work fine with curl_cffi. Detect at import time.
+def _is_wsl2() -> bool:
+    """Return True if running on WSL2 (where curl_cffi hangs)."""
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except Exception:
+        return False
+
 # SNlM0e is dead (Jul 2026); tokens fetched from gemini.google.com/app.
 def _wsl2_init_fix():
     try:
@@ -64,7 +73,8 @@ def _wsl2_init_fix():
     except Exception:
         pass
 
-_wsl2_init_fix()
+if _is_wsl2():
+    _wsl2_init_fix()
 
 # ── Dependencies ─────────────────────────────────────────────
 
@@ -549,7 +559,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 new_name = args.edit_new_name or g.name
                 new_desc = args.edit_new_desc if args.edit_new_desc is not None else (g.description or "")
                 new_instr = args.edit_sys_instr if args.edit_sys_instr else None
-                await client.edit_gem(g=g, name=new_name, description=new_desc,
+                await client.update_gem(gem=g, name=new_name, description=new_desc,
                                       prompt=new_instr)
                 print(json.dumps({"ok": True, "action": "edit-gem",
                                   "id": g.id, "name": new_name}))
