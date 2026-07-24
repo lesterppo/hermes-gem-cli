@@ -408,6 +408,9 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         # Deep research
         p.add_argument("--deep-research", action="store_true", dest="deep_research",
                        help="Deep research mode (~1-10 min)")
+        # Streaming
+        p.add_argument("--stream", action="store_true", dest="stream",
+                       help="Stream tokens in real-time")
         # Output
         p.add_argument("-o", "--output", metavar="FILE", help="Output file")
         p.add_argument("--json-out", action="store_true", help="Write .json not .md")
@@ -787,42 +790,88 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 if args.deep_research:
                     self.log("Creating research plan...")
                     try:
-                        plan = await asyncio.wait_for(
-                            self.client.create_deep_research_plan(prompt, model=model), timeout=120)
-                        self.log(f"Plan: {plan.title or 'Research'} — starting...")
-                        await asyncio.wait_for(
-                            self.client.start_deep_research(
-                                plan, confirm_prompt="Proceed with this plan without modifications."),
-                            timeout=120)
-                        self.log("Research in progress...")
+                        # Try high-level deep_research first (handles plan+start+wait internally)
+                        self.log("Starting deep research...")
                         result = await asyncio.wait_for(
-                            self.client.wait_for_deep_research(
-                                plan, poll_interval=15.0, timeout=actual_timeout,
+                            self.client.deep_research(
+                                prompt, poll_interval=15.0, timeout=actual_timeout,
                                 on_status=lambda s: (self.log(f"  [{s.state or '...'}]")
                                                       if not self.raw_mode and s else None)),
                             timeout=actual_timeout)
                         response = result.final_output
                     except Exception as plan_err:
                         plan_msg = str(plan_err)
-                        # Check if account is not eligible at all
                         if "not eligible" in plan_msg.lower() or "rejected" in plan_msg.lower():
                             fail("DEEP_RESEARCH_REJECTED",
                                  f"Account not eligible for deep research. {plan_msg}",
                                  {"retry": False})
-                        # Otherwise fallback: use generate_content with deep_research=True
-                        self.log(f"Plan-based deep research failed, trying direct mode: {plan_msg}")
-                        kwargs = {"prompt": prompt, "deep_research": True}
-                        if model: kwargs["model"] = model
-                        response = await asyncio.wait_for(
-                            self.client.generate_content(**kwargs), timeout=actual_timeout)
+                        # Fallback: manual plan-based flow
+                        self.log(f"High-level DR failed, trying manual plan: {plan_msg}")
+                        try:
+                            plan = await asyncio.wait_for(
+                                self.client.create_deep_research_plan(prompt, model=model), timeout=120)
+                            self.log(f"Plan: {plan.title or 'Research'} — starting...")
+                            await asyncio.wait_for(
+                                self.client.start_deep_research(
+                                    plan, confirm_prompt="Proceed with this plan without modifications."),
+                                timeout=120)
+                            self.log("Research in progress...")
+                            result = await asyncio.wait_for(
+                                self.client.wait_for_deep_research(
+                                    plan, poll_interval=15.0, timeout=actual_timeout,
+                                    on_status=lambda s: (self.log(f"  [{s.state or '...'}]")
+                                                          if not self.raw_mode and s else None)),
+                                timeout=actual_timeout)
+                            response = result.final_output
+                        except Exception as manual_err:
+                            # Last resort: generate_content with deep_research=True
+                            self.log(f"Manual plan failed, trying direct mode: {manual_err}")
+                            kwargs = {"prompt": prompt, "deep_research": True}
+                            if model: kwargs["model"] = model
+                            response = await asyncio.wait_for(
+                                self.client.generate_content(**kwargs), timeout=actual_timeout)
                 else:
                     kwargs = {"prompt": prompt}
                     if all_files: kwargs["files"] = all_files
                     if chat_metadata: kwargs["chat"] = ChatRef(chat_metadata)
                     if model: kwargs["model"] = model
                     kwargs["gem"] = gem_id
-                    response = await asyncio.wait_for(
-                        self.client.generate_content(**kwargs), timeout=actual_timeout)
+                    if args.stream:
+                        # Streaming mode — print only new tokens as they arrive
+                        full_text = []
+                        if not self.raw_mode:
+                            sys.stderr.write("[streaming] ")
+                            sys.stderr.flush()
+                        async for chunk in self.client.generate_content_stream(**kwargs):
+                            if hasattr(chunk, 'text') and chunk.text:
+                                text = chunk.text
+                                # Chunks are cumulative — only print new portion
+                                if full_text:
+                                    prev = full_text[-1]
+                                    if text.startswith(prev) and len(text) > len(prev):
+                                        new = text[len(prev):]
+                                        full_text.append(text)
+                                        if not self.raw_mode:
+                                            sys.stderr.write(new)
+                                            sys.stderr.flush()
+                                else:
+                                    full_text.append(text)
+                                    if not self.raw_mode:
+                                        sys.stderr.write(text)
+                                        sys.stderr.flush()
+                        if not self.raw_mode:
+                            sys.stderr.write("\n")
+                        # Use the last (most complete) chunk as response text
+                        final_text = full_text[-1] if full_text else ""
+                        class StreamResponse:
+                            def __init__(self, text):
+                                self.text = text
+                                self.images = []
+                                self.metadata = None
+                        response = StreamResponse(final_text)
+                    else:
+                        response = await asyncio.wait_for(
+                            self.client.generate_content(**kwargs), timeout=actual_timeout)
             except asyncio.TimeoutError:
                 if attempt == max_attempts - 1:
                     # Playwright fallback
