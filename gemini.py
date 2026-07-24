@@ -786,21 +786,35 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             try:
                 if args.deep_research:
                     self.log("Creating research plan...")
-                    plan = await asyncio.wait_for(
-                        self.client.create_deep_research_plan(prompt, model=model), timeout=120)
-                    self.log(f"Plan: {plan.title or 'Research'} — starting...")
-                    await asyncio.wait_for(
-                        self.client.start_deep_research(
-                            plan, confirm_prompt="Proceed with this plan without modifications."),
-                        timeout=120)
-                    self.log("Research in progress...")
-                    result = await asyncio.wait_for(
-                        self.client.wait_for_deep_research(
-                            plan, poll_interval=15.0, timeout=actual_timeout,
-                            on_status=lambda s: (self.log(f"  [{s.state or '...'}]")
-                                                  if not self.raw_mode and s else None)),
-                        timeout=actual_timeout)
-                    response = result.final_output
+                    try:
+                        plan = await asyncio.wait_for(
+                            self.client.create_deep_research_plan(prompt, model=model), timeout=120)
+                        self.log(f"Plan: {plan.title or 'Research'} — starting...")
+                        await asyncio.wait_for(
+                            self.client.start_deep_research(
+                                plan, confirm_prompt="Proceed with this plan without modifications."),
+                            timeout=120)
+                        self.log("Research in progress...")
+                        result = await asyncio.wait_for(
+                            self.client.wait_for_deep_research(
+                                plan, poll_interval=15.0, timeout=actual_timeout,
+                                on_status=lambda s: (self.log(f"  [{s.state or '...'}]")
+                                                      if not self.raw_mode and s else None)),
+                            timeout=actual_timeout)
+                        response = result.final_output
+                    except Exception as plan_err:
+                        plan_msg = str(plan_err)
+                        # Check if account is not eligible at all
+                        if "not eligible" in plan_msg.lower() or "rejected" in plan_msg.lower():
+                            fail("DEEP_RESEARCH_REJECTED",
+                                 f"Account not eligible for deep research. {plan_msg}",
+                                 {"retry": False})
+                        # Otherwise fallback: use generate_content with deep_research=True
+                        self.log(f"Plan-based deep research failed, trying direct mode: {plan_msg}")
+                        kwargs = {"prompt": prompt, "deep_research": True}
+                        if model: kwargs["model"] = model
+                        response = await asyncio.wait_for(
+                            self.client.generate_content(**kwargs), timeout=actual_timeout)
                 else:
                     kwargs = {"prompt": prompt}
                     if all_files: kwargs["files"] = all_files
@@ -865,12 +879,17 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 sd = Path(args.save_images)
                 sd.mkdir(parents=True, exist_ok=True)
                 saved = []
+                # Build cookie header for Google CDN auth
+                cookie_str = f"__Secure-1PSID={sid}; __Secure-1PSIDTS={ts}"
                 for i, img in enumerate(images_out):
                     try:
                         fp = sd / f"gemini_img_{i}.png"
-                        _ur.urlretrieve(img["url"], str(fp))
+                        req = _ur.Request(img["url"], headers={"Cookie": cookie_str})
+                        with _ur.urlopen(req, timeout=30) as resp:
+                            fp.write_bytes(resp.read())
                         saved.append(str(fp))
-                    except Exception: pass
+                    except Exception as dl_err:
+                        self.log(f"Image {i} download failed: {dl_err}")
                 if saved:
                     self.log(f"Saved {len(saved)} image(s) to {sd}")
 
