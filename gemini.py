@@ -144,7 +144,7 @@ _MODEL_LABEL_MAP = {
 }
 
 _LITE_MODEL_DICT = {
-    "model_name": "gemini-3.5-flash-lite",
+    "model_name": "Flash-Lite",
     "model_header": {
         "x-goog-ext-525001261-jspb": '[1,null,null,null,"8c46e95b1a07cecc",null,null,0,[4],null,null,1]',
         "x-goog-ext-73010989-jspb": "[0]",
@@ -184,7 +184,7 @@ def resolve_model_string(client, model_str: str) -> str:
         except AttributeError: pass
     try:
         available = client.list_models()
-        known = {"8c46e95b1a07cecc": "gemini-3-flash-lite",
+        known = {"8c46e95b1a07cecc": "Flash-Lite",
                  "56fdd199312815e2": "gemini-3-flash",
                  "e6fa609c3fa255c0": "gemini-3-pro"}
         name_map = {known.get(m.model_id, str(m).lower()):
@@ -200,7 +200,10 @@ def resolve_model_string(client, model_str: str) -> str:
     if q in ("pro",):
         return next((v for k, v in name_map.items()
                      if "pro" in k and "thinking" not in k), model_str)
-    if q in ("lite",): return dict(_LITE_MODEL_DICT)
+    if q in ("lite",):
+        matches = [v for k, v in name_map.items() if "flash-lite" in k.lower() or "lite" in k.lower()]
+        if matches: return matches[0]
+        return dict(_LITE_MODEL_DICT)
     return model_str
 
 # ── 5-tier auth chain ────────────────────────────────────────
@@ -491,15 +494,79 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         if args.account_status:
             sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
             try:
+                from gemini_webapi.constants import GRPC as _GRPC, AccountStatus as _AS
+                from gemini_webapi.client import RPCData as _RPCData
+                from gemini_webapi.utils.parsing import extract_json_from_response as _extract, get_nested_value as _gv
                 client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
                 await client.init()
-                # Fetch gems to probe account validity
-                await client.fetch_gems()
-                gems = [{"id": gid, "name": g.name} for gid, g in client.gems.items()]
-                print(json.dumps({"ok": True, "authenticated": True,
-                                  "gems": len(gems), "gem_list": gems}))
+                
+                result = {
+                    "ok": True,
+                    "status_code": int(client.account_status),
+                    "status_name": client.account_status.name,
+                    "status_desc": client.account_status.description,
+                    "language": client.language,
+                    "session_id": str(client.session_id),
+                    "build": client.build_label,
+                }
+                
+                # ── Email from HTML ──
+                try:
+                    r = await client.client.get("https://gemini.google.com/app")
+                    emails = set(re.findall(r'[\w.+-]+@gmail\.com', r.text))
+                    result["emails"] = sorted(emails)
+                except Exception:
+                    result["emails"] = []
+                
+                # ── Models ──
+                try:
+                    result["available_models"] = [str(m) for m in client.list_models()]
+                except Exception:
+                    result["available_models"] = []
+                
+                # ── Quota / usage limits ──
+                try:
+                    resp = await client._batch_execute([
+                        _RPCData(rpcid=_GRPC.DEEP_RESEARCH_MODEL_STATE,
+                                 payload="[[[1,11],[2,11],[6,11]]]"),
+                        _RPCData(rpcid=_GRPC.DEEP_RESEARCH_MODEL_STATE,
+                                 payload="[[[1,4],[2,4],[6,4]]]"),
+                    ])
+                    parts = _extract(resp.text)
+                    quotas = []
+                    for part in parts:
+                        body_str = _gv(part, [2])
+                        if not body_str: continue
+                        body = json.loads(body_str)
+                        # Format: [[[[None, model_id], ?, ?, [start_ts, end_ts], daily_limit, used], ...], '']
+                        entries = body[0] if isinstance(body, list) and body else []
+                        for entry in entries:
+                            if not isinstance(entry, list) or len(entry) < 6: continue
+                            quotas.append({
+                                "model_type": entry[0][1] if entry[0] else None,
+                                "model_hint": {4: "pro", 11: "flash"}.get(entry[0][1] if entry[0] else 0, "unknown"),
+                                "daily_limit": entry[4],
+                                "used": entry[5],
+                                "remaining": entry[4] - entry[5] if entry[4] and entry[5] else None,
+                            })
+                    result["quota"] = quotas
+                except Exception as e:
+                    result["quota"] = []
+                    result["quota_error"] = str(e)[:80]
+                
+                # ── Gems summary ──
+                try:
+                    await client.fetch_gems()
+                    result["gem_count"] = len(client.gems)
+                    if args.list_gems:
+                        result["gems"] = [{"id": gid, "name": g.name} 
+                                          for gid, g in list(client.gems.items())[:args.limit]]
+                except Exception:
+                    result["gem_count"] = -1
+                
+                print(json.dumps(result, ensure_ascii=False))
             except Exception as e:
-                print(json.dumps({"ok": True, "authenticated": False, "error": str(e)}))
+                fail("ACCOUNT_STATUS_FAILED", str(e))
             return
 
         # ── Standalone: --setup-search-gem ──
@@ -645,14 +712,13 @@ Output: compact JSON pointer on stdout, full response on disk.""")
 
         if args.gem_id:
             gem_id = args.gem_id
-        elif args.list_models or args.list_gems:
+        elif args.list_models or args.list_gems or args.list_chats:
             gem_id = "dummy"
         elif args.url:
             try: gem_id = extract_gem_id(args.url)
             except ValueError as e: fail("BAD_URL", str(e))
         else:
-            p.print_help()
-            fail("NO_URL", "Gem URL, Gem ID, or -g <id> is required.")
+            gem_id = None  # direct chat, no Gem required
 
         # ── Build prompt ──
         if args.image_prompt:
@@ -677,6 +743,8 @@ Output: compact JSON pointer on stdout, full response on disk.""")
 
         # ── Handle --gem-info ──
         if args.gem_info:
+            if not gem_id:
+                fail("GEM_REQUIRED", "A Gem URL, ID, or -g <id> is required for --gem-info.")
             sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
             try:
                 client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
@@ -732,15 +800,21 @@ Output: compact JSON pointer on stdout, full response on disk.""")
 
         # ── Gem name ──
         gem_name = ""
-        try:
-            await self.client.fetch_gems()
-            g = self.client.gems.get(gem_id)
-            if g: gem_name = g.name
-        except Exception: pass
+        if gem_id and gem_id != "dummy":
+            try:
+                await self.client.fetch_gems()
+                g = self.client.gems.get(gem_id)
+                if g: gem_name = g.name
+            except Exception: pass
 
         if not self.raw_mode:
             model_label = friendly_model_label(model)
-            parts = [f"gem={gem_name or gem_id}", f"model={model_label}"]
+            parts = []
+            if gem_name:
+                parts.append(f"gem={gem_name}")
+            elif gem_id and gem_id != "dummy":
+                parts.append(f"gem={gem_id}")
+            parts.append(f"model={model_label}")
             if args.deep_research: parts.append("deep-research")
             if args.image_gen: parts.append("img-gen")
             if args.conversation: parts.append("multi-turn")
@@ -835,7 +909,8 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                     if all_files: kwargs["files"] = all_files
                     if chat_metadata: kwargs["chat"] = ChatRef(chat_metadata)
                     if model: kwargs["model"] = model
-                    kwargs["gem"] = gem_id
+                    if gem_id and gem_id != "dummy":
+                        kwargs["gem"] = gem_id
                     if args.stream:
                         # Streaming mode — print only new tokens as they arrive
                         full_text = []
