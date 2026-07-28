@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""
+gemini-search — Google Search via Gemini Web → AI Agent Pipeline
+
+Token-optimized wrapper that triggers Gemini's Google Search grounding
+and returns machine-parseable JSON for downstream AI agents.
+
+Supports two backends:
+  - Default: Uses a prompt template to trigger search grounding in vanilla Gemini
+  - --gem: Uses a Gemini Gem (custom system prompt) as a Search Grounding Proxy
+
+Examples:
+  gemini-search "latest breakthroughs in fusion energy 2026"
+  gemini-search "what time is it in Tokyo" --mode answer
+  gemini-search "AI regulation updates" -m pro --verbose
+  gemini-search "climate news" -g "Gemini search"  # use a Search Grounding Proxy Gem
+  gemini-search "query" -g "Gemini search" -o results.json
+"""
+import json
+import subprocess
+import sys
+import re
+import argparse
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+GEMINI_CLI = "gemini-cli"
+DEFAULT_MODEL = "flash"
+DEFAULT_TIMEOUT = 60
+
+ERROR_CODES = {
+    "E_SUBPROCESS": "gemini-cli subprocess failed",
+    "E_TIMEOUT": "gemini-cli timed out",
+    "E_PARSE_FAIL": "Could not parse Gemini response as JSON",
+    "E_NO_CODEBLOCK": "Gemini response had no JSON code block",
+    "E_AUTH": "Gemini authentication failed",
+    "E_EMPTY_QUERY": "Search query is empty",
+}
+
+
+# ── Prompt templates ──────────────────────────────────────
+
+STRUCTURED_PROMPT = """Search Google for the following and return your findings as a single valid JSON object inside a ```json code block. The JSON must have exactly these keys:
+
+- "query": the exact search query you used
+- "results": a JSON array of objects, each with "title", "url", and "snippet" (each snippet limited to 300 characters maximum)
+- "answer": a concise 2-4 sentence synthesis answering the query based on the search results
+- "count": total number of results returned (integer)
+
+Return ONLY the JSON code block. No preamble, no commentary, no markdown outside the code block. The JSON must be valid and complete.
+
+Search query: {query}"""
+
+ANSWER_PROMPT = """Search Google for: {query}
+
+Provide a thorough answer synthesizing information from search results. For every factual claim, cite the source URL in parentheses. If search results conflict, note the disagreement."""
+
+
+# ── Key mapping (for default prompt-template backend) ─────
+
+SHORT_KEYS = {
+    "query": "q",
+    "results": "r",
+    "title": "t",
+    "url": "u",
+    "snippet": "s",
+    "answer": "a",
+    "count": "c",
+    "timestamp": "ts",
+    "model": "m",
+}
+
+
+def fail(code: str, msg: str, raw: str | None = None):
+    out = {"error": f"{code}: {msg}"}
+    if raw:
+        out["raw"] = raw[:500]
+    print(json.dumps(out, ensure_ascii=False, separators=(",", ":")))
+    sys.exit(1)
+
+
+def _ensure_search_gem(timeout: int = DEFAULT_TIMEOUT):
+    """Silently ensure the 'Gemini search' Gem exists. Best-effort, never fails."""
+    try:
+        result = subprocess.run(
+            [GEMINI_CLI, "--json", "--setup-search-gem"],
+            capture_output=True, text=True, timeout=min(timeout, 60),
+            env={**os.environ},
+        )
+        if result.returncode != 0:
+            return
+        data = json.loads(result.stdout.strip())
+        if data.get("ok") and data.get("gem_id"):
+            return data["gem_id"]
+    except Exception:
+        pass
+    return None
+
+
+def emit_pointer(file_path: Path, text: str, code_blocks: int):
+    """Emit a token-minimal pointer JSON when -o is used."""
+    try:
+        rel = file_path.resolve().relative_to(Path.cwd())
+        short = "./" + str(rel).replace("\\", "/")
+    except ValueError:
+        short = str(file_path.resolve())
+    pointer = {
+        "ok": True,
+        "f": short,
+        "s": file_path.stat().st_size,
+        "b": code_blocks,
+    }
+    print(json.dumps(pointer, ensure_ascii=False))
+
+
+def remap_keys(obj, to_short: bool = True):
+    """Recursively remap dict keys using SHORT_KEYS."""
+    mapping = SHORT_KEYS if to_short else {v: k for k, v in SHORT_KEYS.items()}
+    if isinstance(obj, dict):
+        return {mapping.get(k, k): remap_keys(v, to_short) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [remap_keys(item, to_short) for item in obj]
+    return obj
+
+
+def extract_json_from_text(text: str) -> dict | None:
+    """Extract JSON from Gemini's response. Tries code block, then raw JSON."""
+    # 1) Try ```json code block
+    pattern = r"```json\s*\n(.*?)```"
+    matches = re.findall(pattern, text, re.DOTALL)
+    for match in matches:
+        try:
+            return json.loads(match.strip())
+        except json.JSONDecodeError:
+            obj_match = re.search(r"\{.*\}", match, re.DOTALL)
+            if obj_match:
+                try:
+                    return json.loads(obj_match.group())
+                except json.JSONDecodeError:
+                    continue
+    # 2) Try parsing the whole text as JSON directly (Gemini often returns raw JSON)
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        pass
+    # 3) Try finding a JSON object anywhere in the text
+    obj_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if obj_match:
+        try:
+            return json.loads(obj_match.group())
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def clean_markdown_urls(obj):
+    """Recursively strip markdown link syntax from all string values.
+    Converts [text](url) -> url and [url](url) -> url."""
+    if isinstance(obj, str):
+        return re.sub(r"\[.*?\]\((https?://[^)]+)\)", r"\1", obj)
+    elif isinstance(obj, dict):
+        return {k: clean_markdown_urls(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_markdown_urls(item) for item in obj]
+    return obj
+
+
+def parse_gem_output(text: str) -> dict | None:
+    """Parse Gem output — the Gem returns raw JSON directly (no code block wrapper).
+    Uses raw_decode for partial recovery when Gemini truncates."""
+    text = text.strip()
+    try:
+        data = json.loads(text)
+        return clean_markdown_urls(data)
+    except json.JSONDecodeError:
+        # Try raw_decode for partial recovery (JSON truncated mid-generation)
+        try:
+            decoder = json.JSONDecoder()
+            partial, _ = decoder.raw_decode(text)
+            if isinstance(partial, dict):
+                partial["_truncated"] = True
+                return clean_markdown_urls(partial)
+        except json.JSONDecodeError:
+            pass
+        # Try finding a JSON object within the text
+        obj_match = re.search(r"\{.*\}", text, re.DOTALL)
+        if obj_match:
+            try:
+                return clean_markdown_urls(json.loads(obj_match.group()))
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+def validate_search_json(data: dict) -> list[str]:
+    """Validate the extracted JSON has required fields. Returns list of warnings."""
+    warnings = []
+    if "query" not in data:
+        warnings.append("missing 'query' field")
+    if "results" not in data:
+        warnings.append("missing 'results' field")
+    elif not isinstance(data.get("results"), list):
+        warnings.append("'results' is not an array")
+    if "answer" not in data:
+        warnings.append("missing 'answer' field")
+    if "count" not in data:
+        data["count"] = len(data.get("results", []))
+    return warnings
+
+
+def run_gemini(prompt: str, model: str = DEFAULT_MODEL,
+               timeout: int = DEFAULT_TIMEOUT, gem: str | None = None) -> dict:
+    """Run gemini-cli --json with the given prompt, return response text + metadata."""
+    cmd = [GEMINI_CLI, "--json", "-m", model, "-q"]
+    if gem:
+        cmd.extend(["-g", gem, prompt])
+    else:
+        cmd.extend(["-p", prompt])
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ},
+        )
+    except subprocess.TimeoutExpired:
+        fail("E_TIMEOUT", f"gemini-cli timed out after {timeout}s")
+    except FileNotFoundError:
+        fail("E_SUBPROCESS",
+             "gemini-cli not found. Install: pip install --break-system-packages gemini-webapi browser-cookie3")
+
+    stdout = result.stdout.strip() if result.stdout else ""
+
+    if not stdout:
+        stderr = result.stderr.strip()
+        fail("E_SUBPROCESS", stderr or "gemini-cli produced no output")
+
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        fail("E_PARSE_FAIL", "gemini-cli returned non-JSON output", raw=stdout)
+
+    if not envelope.get("ok"):
+        err_code = envelope.get("err", "UNKNOWN")
+        err_msg = envelope.get("msg", "Unknown error")
+        fail(err_code, err_msg)
+
+    # gemini-cli --json returns a POINTER: {"ok":true,"f":"path.md","s":1234}
+    # The actual response text is in the file at envelope["f"]
+    text = ""
+    native_images = envelope.get("images", [])
+    if "f" in envelope:
+        try:
+            resp = json.loads(Path(envelope["f"]).read_text(encoding="utf-8"))
+            text = resp.get("text", "")
+            native_images = resp.get("images", native_images)
+        except (json.JSONDecodeError, FileNotFoundError):
+            text = envelope.get("text", "")
+    else:
+        text = envelope.get("text", "")
+
+    # Sometimes text is itself a JSON-encoded string — decode it
+    if isinstance(text, str) and text.strip().startswith("{"):
+        try:
+            inner = json.loads(text)
+            if isinstance(inner, dict) and "text" in inner:
+                text = inner["text"]
+            elif isinstance(inner, str):
+                text = inner
+        except json.JSONDecodeError:
+            pass
+
+    return {"text": text, "images": native_images, "model": envelope.get("model", ""),
+            "gem": envelope.get("gem", "")}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Google Search via Gemini Web → AI Agent Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  gemini-search "latest breakthroughs in fusion energy 2026"
+  gemini-search "what time is it in Tokyo" --mode answer
+  gemini-search "AI regulation updates" -m pro --verbose
+  gemini-search "climate news" -g "Gemini search" -o results.json""")
+    parser.add_argument("query", nargs="+", type=str,
+                        help="Search query (concatenated with spaces)")
+    parser.add_argument("-m", "--model", type=str, default=DEFAULT_MODEL,
+                        help=f"Model: flash (default), pro, thinking")
+    parser.add_argument("-g", "--gem", type=str, metavar="GEM",
+                        help="Gem ID or name to use as Search Grounding Proxy "
+                             "(bypasses prompt template, Gem provides its own instructions)")
+    parser.add_argument("--json", action="store_true", dest="json_out",
+                        default=True, help="Structured JSON output (default)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Use long key names instead of short keys")
+    parser.add_argument("--mode", type=str, choices=["structured", "answer"],
+                        default="structured",
+                        help="structured (default, JSON) or answer (natural language)")
+    parser.add_argument("-o", "--output", type=str, metavar="FILE",
+                        help="Write full response to FILE (stdout gets pointer)")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress stderr progress")
+    parser.add_argument("-t", "--timeout", type=int, default=DEFAULT_TIMEOUT,
+                        help=f"Subprocess timeout in seconds (default: {DEFAULT_TIMEOUT})")
+    args = parser.parse_args()
+
+    query = " ".join(args.query).strip()
+    if not query:
+        fail("E_EMPTY_QUERY", "Search query is empty")
+
+    # ── Build prompt ──────────────────────────────────────
+    if args.gem:
+        # Auto-setup the search Gem if needed (silently, best-effort)
+        _ensure_search_gem(args.timeout)
+        # Gem has its own search grounding instructions — pass query raw
+        prompt = query
+    elif args.mode == "answer":
+        prompt = ANSWER_PROMPT.format(query=query)
+    else:
+        prompt = STRUCTURED_PROMPT.format(query=query)
+
+    # ── Run gemini-cli ────────────────────────────────────
+    resp = run_gemini(prompt, model=args.model, timeout=args.timeout,
+                      gem=args.gem)
+    text = resp["text"]
+    native_images = resp.get("images", [])
+
+    # ── Answer mode (no Gem): just output the text ────────
+    if args.mode == "answer" and not args.gem:
+        if args.output:
+            out_path = Path(args.output)
+            out_path.write_text(text, encoding="utf-8")
+            emit_pointer(out_path, text, 0)
+        else:
+            print(text)
+        return
+
+    # ── Gem mode: Gem output is raw JSON, pass it through ─
+    if args.gem:
+        gem_data = parse_gem_output(text)
+        if gem_data is None:
+            fail("E_PARSE_FAIL",
+                 "Gem response was not valid JSON.", raw=text)
+
+        # Merge native web images from Gemini API with Gem's metadata
+        # Gem's "i": [sourceIndex, altText, pageTitle] — metadata
+        # Native images: [{url, alt}] — actual image URLs from API
+        # Zip positionally: [sourceIndex, altText, pageTitle, imageUrl]
+        if native_images and gem_data.get("type") == "img" and "i" in gem_data:
+            merged = []
+            for idx, (meta, native) in enumerate(zip(gem_data["i"], native_images)):
+                if len(meta) >= 3:
+                    merged.append([meta[0], meta[1], meta[2], native.get("url", "")])
+                else:
+                    merged.append(meta + [native.get("url", "")])
+            # Append any leftover native images not covered by Gem metadata
+            for extra in native_images[len(gem_data["i"]):]:
+                merged.append([-1, extra.get("alt", ""), "", extra.get("url", "")])
+            gem_data["i"] = merged
+        elif native_images:
+            # No Gem metadata to merge — just add raw image URLs
+            gem_data["img"] = native_images
+
+        if args.output:
+            out_path = Path(args.output)
+            envelope = {"ok": True, "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "m": args.model, "gem": args.gem, **gem_data}
+            out_path.write_text(json.dumps(envelope, ensure_ascii=False),
+                                encoding="utf-8")
+            emit_pointer(out_path, json.dumps(envelope), 0)
+        else:
+            # Agent-to-agent: pure payload, no wrapper
+            print(json.dumps(gem_data, ensure_ascii=False, separators=(",", ":")))
+        return
+
+    # ── Default structured mode: extract and validate JSON ─
+    search_data = extract_json_from_text(text)
+
+    if search_data is None:
+        fail("E_NO_CODEBLOCK",
+             "Gemini response had no ```json code block. "
+             "Try --mode answer or rephrase the query.",
+             raw=text)
+
+    warnings = validate_search_json(search_data)
+
+    if "count" not in search_data:
+        search_data["count"] = len(search_data.get("results", []))
+
+    # ── Remap keys (short by default) ────────────────────
+    if not args.verbose:
+        search_data = remap_keys(search_data, to_short=True)
+
+    # ── Emit ─────────────────────────────────────────────
+    if args.output:
+        search_data["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        search_data["model"] = args.model
+        if warnings:
+            search_data["warnings"] = warnings
+        out_path = Path(args.output)
+        payload = {"ok": True, "data": search_data}
+        if warnings:
+            payload["warnings"] = warnings
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+        emit_pointer(out_path, json.dumps(search_data), 0)
+    else:
+        # Agent-to-agent: pure payload, no wrapper or metadata
+        if warnings:
+            search_data["warnings"] = warnings
+        print(json.dumps(search_data, ensure_ascii=False, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

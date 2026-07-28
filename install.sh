@@ -18,9 +18,14 @@ $PYTHON -m pip install gemini-webapi browser-cookie3 loguru
 INSTALL_DIR="${HOME}/.local/bin"
 mkdir -p "$INSTALL_DIR"
 cp gem-cli.py "$INSTALL_DIR/gem-cli"
-chmod +x "$INSTALL_DIR/gem-cli"
+cp gemini.py "$INSTALL_DIR/gemini-cli"
+cp gemini-search "$INSTALL_DIR/gemini-search"
+chmod +x "$INSTALL_DIR/gem-cli" "$INSTALL_DIR/gemini-cli" "$INSTALL_DIR/gemini-search"
 
-echo "[3/3] Installed to $INSTALL_DIR/gem-cli"
+echo "[3/3] Installed to $INSTALL_DIR/"
+echo "  gem-cli       — AI-agent-native Gem CLI (token-efficient)"
+echo "  gemini-cli    — Gemini CLI (full features)"
+echo "  gemini-search — Google Search via Gemini (structured JSON)"
 echo ""
 
 # Check if in PATH
