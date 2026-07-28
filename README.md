@@ -1,7 +1,57 @@
-# hermes-gem-cli
+# gem-cli — Gemini Gem CLI via WebAPI (No API Key, Fast)
 
-AI-agent-native, token-efficient CLI for interacting with shared Gemini Gems.
-Takes any shared Gem URL, extracts the Gem ID, and lets you chat with it.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/lesterppo/hermes-gem-cli/blob/main/LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
+[![Platform: Linux](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey.svg)]()
+
+**AI-agent-native CLI for Google Gemini Gems — chat, image generation, deep
+research, Gem CRUD. No API key. Uses browser cookies via the `gemini-webapi`
+library. 3-10x faster than browser automation on native Linux (~4s per chat).**
+
+```text
+gemini-cli -p "prompt"                           → Direct chat (no Gem, fastest)
+gemini-cli <gem-id> "prompt"                      → Chat with a Gem
+gemini-cli <gem-id> -c sess.json --new "msg"      → Multi-turn conversation
+gemini-cli <gem-id> --img "description"            → Image generation (Imagen)
+gemini-cli <gem-id> -m pro --deep-research "q"     → Deep research
+gemini-cli --create-gem "Name" -p "instructions"  → Create a Gem
+gemini-cli --delete-gem <id>                       → Delete a Gem
+gemini-cli --list-gems                             → List all your Gems
+```
+
+> **Looking for the browser-based alternative?** See
+> [hermes-gem-pw](https://github.com/lesterppo/hermes-gem-pw) — drives a real
+> Chromium via Playwright/CDP. Works on WSL2, supports knowledge upload at Gem
+> creation. Slower (~15-40s) but universally reliable.
+
+---
+
+## Why WebAPI?
+
+`gemini-webapi` is a Python library that calls Google's internal Gemini API
+directly over HTTP. On **native Linux**, `curl_cffi` enables fast, reliable
+requests (~4s chat). This is 3-10x faster than browser automation.
+
+**Platform compatibility:**
+- **Native Linux**: Full support. All features work. ~4s chat.
+- **WSL2**: `curl_cffi` hangs on POST. Use [hermes-gem-pw](https://github.com/lesterppo/hermes-gem-pw) instead.
+- **macOS**: Untested (likely works, curl_cffi has native macOS support).
+
+## Features
+
+| Feature | Command | Speed |
+|---------|---------|-------|
+| Direct chat (no Gem) | `gemini-cli -p "prompt"` | ~4s |
+| Gem chat | `gemini-cli <id> "prompt"` | ~4s |
+| Multi-turn conversation | `gemini-cli <id> -c sess.json --new "msg"` | ~4-30s |
+| Image generation | `gemini-cli <id> --img "description"` | ~10s |
+| Deep research | `gemini-cli <id> -m pro --deep-research "q"` | ~5-10min |
+| File upload (PDF, TXT) | `gemini-cli <id> -f file.pdf "summarize"` | ~5s |
+| Image upload | `gemini-cli <id> -i photo.png "describe"` | ~5s |
+| Gem CRUD | `--create-gem` / `--delete-gem` / `--list-gems` | <1s |
+| Model selection | `-m flash` / `pro` / `lite` | — |
+| Extended thinking | `--thinking extended` | adds ~30-60s |
+| Streaming output | `--stream` | real-time tokens |
 
 ## Install
 
@@ -20,92 +70,67 @@ curl -fsSL https://raw.githubusercontent.com/lesterppo/hermes-gem-cli/main/insta
 
 ```bash
 # One-time: cache auth tokens from browser
-gem-cli --init
+gemini-cli --init
 
-# Chat with a shared Gem
-gem-cli "https://gemini.google.com/gem/<GEM_ID>" "Hello, what can you help with?"
+# Direct chat (fastest, no Gem needed)
+gemini-cli -p "What is the capital of France?"
 
-# Multi-turn conversation
-gem-cli "<GEM_ID>" -c sess.json --new "first message"
-gem-cli "<GEM_ID>" -c sess.json "follow-up question"
+# Chat with a Gem
+gemini-cli abc123def456 "Explain quantum computing in one sentence"
 
-# With model selection and thinking tiers
-gem-cli "<GEM_ID>" -m pro --thinking extended "deep analysis"
+# Multi-turn (Gem remembers context)
+gemini-cli abc123def456 -c /tmp/session.json --new "My name is Alex"
+gemini-cli abc123def456 -c /tmp/session.json "What is my name?"
 
 # Image generation
-gem-cli "<GEM_ID>" --img "a cat reading a book"
+gemini-cli abc123def456 --img "a sunset over mountains"
 
-# Deep research (auto-plans, web search, synthesis)
-gem-cli "<GEM_ID>" -m pro --deep-research "complex research question"
+# Deep research (Pro model recommended)
+gemini-cli abc123def456 -m pro --deep-research "Latest CRISPR advancements"
+
+# Create + delete a Gem
+gemini-cli --create-gem "MyBot" -p "You are a helpful assistant"
+gemini-cli --delete-gem abc123def456
 ```
 
 ## Design Principles
 
-- **Token-efficient**: stdout is always a compact JSON pointer (~60-80 chars), full response on disk
-- **AI-agent-native**: structured JSON output, clear error codes, subprocess-safe piping
-- **URL-first**: paste any shared Gem URL, it extracts the ID automatically
+- **Token-efficient**: stdout is always compact JSON (~60-80 chars), full
+  response on disk
+- **AI-agent-native**: structured JSON output, clear error codes, subprocess-safe
+- **URL-first**: paste any shared Gem URL, ID extracted automatically
 - **5-tier auth**: env vars → cached file → browser scan → retry → login fallback
-
-## Features
-
-| Feature | Flag |
-|---------|------|
-| Multi-turn conversation | `-c FILE --new` |
-| File upload (PDF, TXT, CSV) | `-f FILE` |
-| Image upload | `-i FILE` |
-| Image generation | `--img PROMPT` |
-| Model switch | `-m flash/pro/thinking/lite` |
-| Thinking tiers | `--thinking standard/plus/extended` |
-| Deep research | `--deep-research` |
-| Structured JSON output | `--json-out` |
-| Pure JSON (zero stderr) | `--raw` |
-| Brief responses | `--brief` |
-| Timeout control | `-t SEC` |
 
 ## Output Format
 
-**Stdout** (always compact JSON):
+**Success:**
 ```json
-{"ok":true,"f":"./out.md","s":1234,"b":2,"imgs":1,"model":"pro+extended","gem":"GemName","dr":true,"c":"c_xxx","t":3}
+{"ok":true,"f":"./out.md","s":1234,"b":2,"imgs":1,"model":"flash","gem":"GemName","dr":true,"c":"c_xxx","t":3}
 ```
 
-**Error** (structured):
+**Error:**
 ```json
 {"ok":false,"err":"RATE_LIMIT","msg":"...","retry_after_s":30,"retry":true}
 ```
+
+## Related Projects
+
+- **[hermes-gem-pw](https://github.com/lesterppo/hermes-gem-pw)** — CDP/browser
+  Gemini CLI. Drives real Chromium via Playwright. Works on WSL2 (where
+  webapi hangs). Supports knowledge upload at Gem creation (PDF, GitHub repo,
+  folder). Slower (~15-40s) but universally reliable.
 
 ## Requirements
 
 - Python 3.10+
 - Firefox or Chrome signed into gemini.google.com
-- Dependencies: `gemini-webapi`, `browser-cookie3`, `loguru`
-
-## Architecture — gemini-webapi vs gem-pw
-
-**gemini-webapi** (Python library) provides the `GeminiClient` for direct HTTP
-calls to Google's internal API. However, as of July 2026, Google's
-`batchexecute` and `StreamGenerate` POST endpoints are **browser-gated** —
-they silently drop connections from non-browser HTTP clients (curl, urllib,
-curl_cffi — tested on WSL2, Windows, and native Linux). GET requests
-(token extraction) work; POST requests (chat, Gem CRUD, discovery) hang
-indefinitely.
-
-**gem-pw** (browser automation) drives a real Chromium browser via Playwright.
-This is the only working path for Gem chat, create, edit, delete, image gen,
-and deep research. The browser sends real TLS fingerprints and HTTP/2 headers
-that Google accepts.
-
-`gemini.py` routes operations as follows:
-- `--init`, `--list-models`, `--list-gems`: gemini-webapi (GET works)
-- Chat, Gem CRUD, image gen, deep research: gem-pw fallback
-- `--list-chats`, `--account-status`: gemini-webapi (when available)
-
-When POST operations are blocked, the tool automatically falls back to
-`gem-pw` (if installed) — no API key, no payment needed.
+- `pip install gemini-webapi browser-cookie3 loguru`
+- Native Linux (or macOS — untested). For WSL2, use gem-pw.
 
 ## Privacy
 
-This tool runs entirely on your machine. No data is sent anywhere except to Google's Gemini API (same as using gemini.google.com in your browser). Auth tokens are cached locally at `~/.gemini-cli/auth.json`.
+Runs entirely on your machine. Auth tokens cached locally at
+`~/.gemini-cli/auth.json`. No data sent anywhere except Google's Gemini API.
 
 ## License
 
