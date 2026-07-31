@@ -17,7 +17,7 @@ gem-cli "<gem-url>" -m flash --brief --raw "prompt"   # agent-optimized
 echo "prompt" | gem-cli "<gem-id>" --raw               # stdin, pure JSON
 ```
 
-## Agent-optimized flags
+### Agent-optimized flags
 
 Always use these for token-efficient agent interaction:
 
@@ -29,6 +29,16 @@ Always use these for token-efficient agent interaction:
 | `--json-out` | JSON output format instead of markdown |
 | `-t SEC` | Timeout (default 120s; auto-extends to 600s for deep research) |
 | `--no-retry` | Fail fast on first error (don't loop) |
+
+### Piping data with -p
+
+When both `-p` and stdin are present, stdin content is appended to the
+`-p` prompt (separated by a blank line). This lets you pipe data files
+while giving instructions:
+
+```bash
+cat data.json | gemini.py -p "Analyze this JSON data." -o report.md --json
+```
 
 ## Output parsing
 

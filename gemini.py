@@ -591,6 +591,10 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         if args.create_gem_name:
             if args.prompt_flag:
                 sys_prompt = args.prompt_flag
+                if not sys.stdin.isatty():
+                    stdin_content = sys.stdin.read().strip()
+                    if stdin_content:
+                        sys_prompt = f"{sys_prompt}\n\n{stdin_content}"
             elif args.edit_sys_instr:
                 sys_prompt = args.edit_sys_instr
             elif args.prompt:
@@ -726,6 +730,10 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             args.image_gen = True
         elif args.prompt_flag:
             prompt = args.prompt_flag
+            if not sys.stdin.isatty():
+                stdin_content = sys.stdin.read().strip()
+                if stdin_content:
+                    prompt = f"{prompt}\n\n{stdin_content}"
         elif args.prompt:
             prompt = " ".join(args.prompt)
         elif args.list_models or args.list_gems or args.gem_info:

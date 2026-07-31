@@ -561,6 +561,10 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             # Read system prompt from stdin, -p, or positional args
             if args.prompt_flag:
                 system_prompt = args.prompt_flag
+                if not sys.stdin.isatty():
+                    stdin_content = sys.stdin.read().strip()
+                    if stdin_content:
+                        system_prompt = f"{system_prompt}\n\n{stdin_content}"
             elif args.prompt:
                 system_prompt = " ".join(args.prompt)
             elif not sys.stdin.isatty():
@@ -661,6 +665,10 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             args.image_gen = True
         elif args.prompt_flag:
             prompt = args.prompt_flag
+            if not sys.stdin.isatty():
+                stdin_content = sys.stdin.read().strip()
+                if stdin_content:
+                    prompt = f"{prompt}\n\n{stdin_content}"
         elif args.prompt:
             prompt = " ".join(args.prompt)
         elif args.list_models or args.list_gems:
