@@ -326,14 +326,19 @@ class GeminiCLI:
             print(f"[gemini] {msg}", file=sys.stderr)
 
     def pointer(self, out_path: Path, conv_state: dict | None = None,
-                images: list | None = None, code_blocks: int = 0,
-                model_label: str = "", gem_name: str = "", deep_research: bool = False):
+                images: list | None = None, videos: list | None = None, media: list | None = None,
+                code_blocks: int = 0, thoughts: bool = False,
+                model_label: str = "", gem_name: str = "", deep_research: bool = False, temporary: bool = False):
         p = {"ok": True, "f": self._short(out_path), "s": out_path.stat().st_size}
         if code_blocks: p["b"] = code_blocks
         if images: p["imgs"] = len(images)
+        if videos: p["vids"] = len(videos)
+        if media: p["media"] = len(media)
+        if thoughts: p["thoughts"] = True
         if model_label: p["model"] = model_label
         if gem_name: p["gem"] = gem_name
         if deep_research: p["dr"] = True
+        if temporary: p["tmp"] = True
         if conv_state:
             p["c"] = conv_state.get("cid")
             p["t"] = conv_state.get("turns")
@@ -386,8 +391,13 @@ class GeminiCLI:
   gemini --delete-gem AbCdEf1234                       # delete Gem
   gemini --list-chats                                  # chat history
   gemini --read-chat c_xxx                             # read a chat
+  gemini --fetch-latest c_xxx                          # fetch latest turn
+  gemini --deep-research-status <research_id>          # research status
   gemini --account-status                              # check account
   gemini --setup-search-gem                            # create search Gem
+  gemini -p "prompt" --temporary                       # temporary chat
+  gemini -p "prompt" --show-thoughts -m thinking       # show thinking traces
+  gemini -p "hi" --save-videos ./vids                  # save Veo videos
 
 Output: compact JSON pointer on stdout, full response on disk.""")
         
@@ -447,8 +457,17 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         p.add_argument("--account-status", action="store_true", help="Check account status")
         # Search Gem
         p.add_argument("--setup-search-gem", action="store_true", help="Create search grounding Gem")
-        # Save images
+        # Save images/videos/media
         p.add_argument("--save-images", metavar="DIR", help="Save generated images to DIR")
+        p.add_argument("--save-videos", metavar="DIR", help="Save generated videos to DIR")
+        p.add_argument("--save-media", metavar="DIR", help="Save generated media (audio/video) to DIR")
+        # Chat modes
+        p.add_argument("--temporary", action="store_true", help="Temporary chat (not saved to history)")
+        p.add_argument("--show-thoughts", action="store_true", help="Include thinking traces in output")
+        # Additional fetchers
+        p.add_argument("--fetch-latest", dest="fetch_latest_id", metavar="CID", help="Fetch latest turn for chat CID")
+        p.add_argument("--deep-research-status", dest="deep_research_status_id", metavar="ID", help="Get deep research status by research ID")
+        p.add_argument("--extract-canvas", metavar="FILE", help="Save Canvas/HTML artifact to FILE")
         # Timing
         p.add_argument("-t", "--timeout", type=int, default=120, help="Max seconds (default 120)")
         p.add_argument("--no-retry", action="store_true", help="Disable auto-retry")
@@ -709,6 +728,42 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 fail("DELETE_CHAT_FAILED", str(e))
             return
 
+        # ── Standalone: --fetch-latest ──
+        if args.fetch_latest_id:
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            try:
+                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                await client.init()
+                out = await client.fetch_latest_chat_response(args.fetch_latest_id)
+                if out:
+                    data = {"ok": True, "cid": args.fetch_latest_id, "text": out.text}
+                    if out.thoughts: data["thoughts"] = out.thoughts
+                    imgs = [{"url": i.url, "alt": i.alt or ""} for i in (out.images or [])]
+                    if imgs: data["images"] = imgs
+                    vids = [{"url": v.url, "title": v.title or ""} for v in (out.videos or [])]
+                    if vids: data["videos"] = vids
+                    print(json.dumps(data, ensure_ascii=False))
+                else:
+                    fail("FETCH_LATEST_FAILED", f"No response for {args.fetch_latest_id}")
+            except Exception as e:
+                fail("FETCH_LATEST_FAILED", str(e))
+            return
+
+        # ── Standalone: --deep-research-status ──
+        if args.deep_research_status_id:
+            sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            try:
+                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                await client.init()
+                st = await client.get_deep_research_status(args.deep_research_status_id)
+                if st:
+                    print(json.dumps({"ok": True, "status": st.model_dump() if hasattr(st, "model_dump") else str(st)}, ensure_ascii=False, default=str))
+                else:
+                    fail("RESEARCH_STATUS_FAILED", f"No status for {args.deep_research_status_id}")
+            except Exception as e:
+                fail("RESEARCH_STATUS_FAILED", str(e))
+            return
+
         # ── Resolve URL / Gem ID ──
         standalone = args.list_models or args.list_gems
         if standalone and not args.url:
@@ -919,6 +974,8 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                     if model: kwargs["model"] = model
                     if gem_id and gem_id != "dummy":
                         kwargs["gem"] = gem_id
+                    if args.temporary:
+                        kwargs["temporary"] = True
                     if args.stream:
                         # Streaming mode — print only new tokens as they arrive
                         full_text = []
@@ -950,6 +1007,9 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                             def __init__(self, text):
                                 self.text = text
                                 self.images = []
+                                self.videos = []
+                                self.media = []
+                                self.thoughts = None
                                 self.metadata = None
                         response = StreamResponse(final_text)
                     else:
@@ -998,12 +1058,26 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             text = response.text
             new_meta = list(response.metadata) if response.metadata else None
 
-            # Images
-            images_out = []
+            # Images / Videos / Media / Thoughts
+            images_out, videos_out, media_out = [], [], []
+            thoughts_text = None
             try:
                 for img in response.images:
                     images_out.append({"url": img.url, "alt": img.alt or ""})
             except Exception: pass
+            try:
+                for v in response.videos:
+                    videos_out.append({"url": v.url, "title": getattr(v, 'title', '') or ""})
+            except Exception: pass
+            try:
+                for m in response.media:
+                    media_out.append({"url": m.url, "title": getattr(m, 'title', '') or ""})
+            except Exception: pass
+            try:
+                thoughts_text = response.thoughts
+            except Exception: pass
+            # include thoughts for thinking models even if --show-thoughts not set (stored in json)
+            has_thoughts = bool(thoughts_text)
 
             # Save generated images to disk
             if args.save_images and images_out:
@@ -1011,7 +1085,6 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 sd = Path(args.save_images)
                 sd.mkdir(parents=True, exist_ok=True)
                 saved = []
-                # Build cookie header for Google CDN auth
                 cookie_str = f"__Secure-1PSID={sid}; __Secure-1PSIDTS={ts}"
                 for i, img in enumerate(images_out):
                     try:
@@ -1025,8 +1098,48 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 if saved:
                     self.log(f"Saved {len(saved)} image(s) to {sd}")
 
-            # Update conversation
-            if args.conversation and new_meta:
+            # Save generated videos to disk
+            if args.save_videos and videos_out:
+                import urllib.request as _ur
+                sd = Path(args.save_videos)
+                sd.mkdir(parents=True, exist_ok=True)
+                saved = []
+                cookie_str = f"__Secure-1PSID={sid}; __Secure-1PSIDTS={ts}"
+                for i, v in enumerate(videos_out):
+                    try:
+                        fp = sd / f"gemini_video_{i}.mp4"
+                        req = _ur.Request(v["url"], headers={"Cookie": cookie_str})
+                        with _ur.urlopen(req, timeout=60) as resp:
+                            fp.write_bytes(resp.read())
+                        saved.append(str(fp))
+                    except Exception as dl_err:
+                        self.log(f"Video {i} download failed: {dl_err}")
+                if saved:
+                    self.log(f"Saved {len(saved)} video(s) to {sd}")
+
+            # Save generated media (audio/video) to disk
+            if args.save_media and media_out:
+                import urllib.request as _ur
+                sd = Path(args.save_media)
+                sd.mkdir(parents=True, exist_ok=True)
+                saved = []
+                cookie_str = f"__Secure-1PSID={sid}; __Secure-1PSIDTS={ts}"
+                for i, m in enumerate(media_out):
+                    try:
+                        fp = sd / f"gemini_media_{i}.mp4"
+                        req = _ur.Request(m["url"], headers={"Cookie": cookie_str})
+                        with _ur.urlopen(req, timeout=60) as resp:
+                            fp.write_bytes(resp.read())
+                        saved.append(str(fp))
+                    except Exception as dl_err:
+                        self.log(f"Media {i} download failed: {dl_err}")
+                if saved:
+                    self.log(f"Saved {len(saved)} media file(s) to {sd}")
+
+            # Update conversation (skip if temporary)
+            if args.temporary:
+                self.log("Temporary chat — not saving to history")
+            elif args.conversation and new_meta:
                 conv_state["cid"] = new_meta[0]
                 conv_state["metadata"] = new_meta
                 conv_state["turns"] += 1
@@ -1040,15 +1153,47 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             if args.json_out:
                 payload = {"ok": True, "text": text, "model": model_label}
                 if images_out: payload["images"] = images_out
+                if videos_out: payload["videos"] = videos_out
+                if media_out: payload["media"] = media_out
+                if has_thoughts: payload["thoughts"] = thoughts_text
+                if args.temporary: payload["temporary"] = True
                 if conv_state: payload["conversation"] = conv_state
                 out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             else:
                 out_text = text
+                if has_thoughts and args.show_thoughts:
+                    out_text += "\n\n## Thoughts\n\n" + thoughts_text
                 if images_out:
                     out_text += "\n\n## Images\n\n"
                     for i, img in enumerate(images_out):
                         out_text += f"{i+1}. ![{img['alt']}]({img['url']})\n"
+                if videos_out:
+                    out_text += "\n\n## Videos\n\n"
+                    for i, v in enumerate(videos_out):
+                        out_text += f"{i+1}. [Video {v['title']}]({v['url']})\n"
+                if media_out:
+                    out_text += "\n\n## Media\n\n"
+                    for i, m in enumerate(media_out):
+                        out_text += f"{i+1}. [Media]({m['url']})\n"
                 out_path.write_text(out_text, encoding="utf-8")
+
+            # Extract Canvas artifact if requested
+            if args.extract_canvas:
+                try:
+                    canvas_blocks = [cb for cb in self.parse_code_blocks(text) if cb["lang"] in ("html","xml","svg","canvas")]
+                    # fallback: if text contains <!DOCTYPE or <html, dump whole text
+                    canvas_content = None
+                    if canvas_blocks:
+                        canvas_content = canvas_blocks[0]["code"]
+                    elif "<html" in text.lower() or "<!doctype" in text.lower():
+                        canvas_content = text
+                    if canvas_content:
+                        Path(args.extract_canvas).write_text(canvas_content, encoding="utf-8")
+                        self.log(f"Canvas artifact saved to {args.extract_canvas}")
+                    else:
+                        self.log("No Canvas/HTML block found for --extract-canvas")
+                except Exception as ce:
+                    self.log(f"Canvas extract failed: {ce}")
 
             code_blocks = self.parse_code_blocks(text)
 
@@ -1065,9 +1210,9 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                     print(cb["code"])
                 return
 
-            self.pointer(out_path, conv_state if args.conversation else None,
-                         images_out, len(code_blocks), model_label, gem_name,
-                         args.deep_research)
+            self.pointer(out_path, conv_state if args.conversation and not args.temporary else None,
+                         images_out, videos_out, media_out, len(code_blocks), has_thoughts,
+                         model_label, gem_name, args.deep_research, args.temporary)
             return
 
 # ── Entry point ──────────────────────────────────────────────
