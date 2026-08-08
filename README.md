@@ -51,6 +51,12 @@ requests (~4s chat). This is 3-10x faster than browser automation.
 | Gem CRUD | `--create-gem` / `--delete-gem` / `--list-gems` | <1s |
 | Model selection | `-m flash` / `pro` / `lite` | — |
 | Extended thinking | `--thinking extended` | adds ~30-60s |
+| Temporary chat | `--temporary` | ephemeral, not in history |
+| Thinking traces | `--show-thoughts` | adds thoughts to output |
+| Video generation | `--save-videos DIR` | Veo 3, 3/day Pro |
+| Canvas artifact | `--extract-canvas FILE` | saves html block |
+| Fetch latest | `--fetch-latest c_xxx` | fast latest turn |
+| Deep research status | `--deep-research-status ID` | poll by ID |
 | Streaming output | `--stream` | real-time tokens |
 
 ## Install

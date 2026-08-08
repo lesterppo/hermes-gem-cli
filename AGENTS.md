@@ -70,6 +70,19 @@ Auth is resolved in this priority order:
 4. Auto-retry with cookie re-scan (3 attempts)
 5. `--login` browser flow
 
+## New flags (Aug 2026)
+
+| Flag | Purpose |
+|------|---------|
+| `--temporary` | Ephemeral chat — not saved to history, pointer `tmp:true` |
+| `--show-thoughts` | Include thinking traces (`thoughts` field, `## Thoughts` in md) |
+| `--save-videos DIR` | Save Veo videos (`GeneratedVideo`, 3/day Pro), pointer `vids` |
+| `--save-media DIR` | Save audio/video media, pointer `media` |
+| `--fetch-latest CID` | Fetch latest turn for chat (faster than `read-chat`) |
+| `--deep-research-status ID` | Poll research status by ID |
+| `--extract-canvas FILE` | Save Canvas/HTML artifact (html/svg/canvas block) |
+| `--read-chat` | Now returns `{cid, turns:[{role,text}], total}` (fixed) |
+
 ## Model + thinking combinations
 
 ```

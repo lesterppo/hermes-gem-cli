@@ -1,7 +1,7 @@
 ---
 name: gem-cli
 description: AI-agent-native CLI for shared Gemini Gems via URL.
-version: 3.0.0
+version: 4.0.0
 author: Peter (lesterppo)
 license: MIT
 tags: [gemini, gem, cli, agent-native, token-efficient]
@@ -69,14 +69,30 @@ gem-cli <gem-id> -m pro --deep-research "complex question"
 # Image generation
 gem-cli <gem-id> --img "a cat reading a book"
 
+# Video generation (Veo 3)
+gem-cli <gem-id> --img "a cat walking" --save-videos ./vids
+
 # File upload
 gem-cli <gem-id> -f report.pdf "summarize this"
 gem-cli <gem-id> -i chart.png "analyze this chart"
+
+# Temporary chats (not saved to history)
+gem-cli <gem-id> --temporary "quick question"
+
+# Thinking traces
+gem-cli <gem-id> -m thinking --show-thoughts "prove sqrt2 irrational"
+
+# Canvas artifacts
+gem-cli <gem-id> --extract-canvas ./page.html "create html button"
 
 # Discovery
 gem-cli --list-models     # Show available models
 gem-cli --list-gems       # Show your Gems
 gem-cli <url> --gem-info  # Check Gem metadata without calling
+gem-cli --list-chats -l 5 # Recent chats
+gem-cli --read-chat c_xxx # Read chat history (turns array)
+gem-cli --fetch-latest c_xxx # Fetch latest turn
+gem-cli --account-status  # Emails, models, quota
 
 # Auth management
 gem-cli --init            # Cache tokens from browser
@@ -95,17 +111,20 @@ Always use these for token-efficient agent interaction:
 | `--json-out` | JSON output format instead of markdown |
 | `-t SEC` | Timeout (default 120s, auto-extends to 600s for `--deep-research`) |
 | `--no-retry` | Fail fast on first error |
+| `--temporary` | Don't save to history (ephemeral) |
+| `--show-thoughts` | Include thinking traces when available |
 
 ## Output Format
 
 **Stdout (success):**
 ```json
 {"ok":true,"f":"./out.md","s":1234,"model":"flash+extended","gem":"GemName","dr":true}
+{"ok":true,"f":"./out.md","s":1234,"imgs":1,"vids":1,"thoughts":true,"tmp":true}
 ```
 
 `f` = output file path, `s` = file size in bytes, `model` = normalized label,
-`gem` = Gem name, `dr` = deep research flag (only when true),
-`c`/`t` = conversation id and turn count (multi-turn only).
+`gem` = Gem name, `dr` = deep research, `imgs`/`vids`/`media` = counts,
+`thoughts`/`tmp` = flags, `c`/`t` = conversation id and turn count.
 
 **Stdout (error):**
 ```json
@@ -114,6 +133,16 @@ Always use these for token-efficient agent interaction:
 
 Error categories: `AUTH_EXPIRED` (retryable), `RATE_LIMIT` (retryable, has `retry_after_s`),
 `TIMEOUT` (retryable), `GEN_FAILED` (not retryable), `BAD_URL`.
+
+## Media Handling
+
+| Flag | Saves to | Notes |
+|------|----------|-------|
+| `--save-images DIR` | `DIR/gemini_img_*.png` | Imagen, cookie auth to CDN |
+| `--save-videos DIR` | `DIR/gemini_video_*.mp4` | Veo 3, 3/day Pro, 5/day Ultra, 206 polling |
+| `--save-media DIR` | `DIR/gemini_media_*.mp4` | Audio/video combined |
+
+If no media in response, CLI logs quota hint instead of silent empty.
 
 ## Model Labels
 
@@ -143,10 +172,12 @@ Auth is resolved in priority order (no configuration needed):
 - Deep research requires Pro model (Flash may hang during plan creation)
 - Pro + extended thinking may exceed default 120s timeout — use `-t 180`
 - Image generation requires Flash model (auto-selected with `--img`)
+- Video generation quota: 3/day Pro, 5/day Ultra — check `--account-status`
 - Cookies expire ~30 days — run `gem-cli --init` to refresh cache
 - `browser_cookie3` only needed for Tier 3; set env vars for CI/remote
 - Shared Gems may be deleted by owner — check with `--gem-info` first
 - Model list from `list_models()` returns display names, not model IDs; the CLI handles resolution automatically
+- `stdin` + `-p` now combined (fixed Aug 2026) — pipe data is appended to `-p` prompt
 
 ## Verification
 
@@ -169,7 +200,11 @@ gem-cli "<url>" -m pro --deep-research "topic"
 # → stderr: "Creating research plan... Plan: <title> — starting... Research in progress..."
 # → {"ok":true,"dr":true,...}
 
-# 5. Pure JSON piping
+# 5. Temporary chat
+gem-cli "<id>" --temporary "quick question"
+# → {"ok":true,"tmp":true,...}  # not in --list-chats
+
+# 6. Pure JSON piping
 echo "prompt" | gem-cli "<id>" --raw
 # → {"ok":true,"f":"...","model":"flash"}  (zero stderr bytes)
 ```
