@@ -426,9 +426,10 @@ class GeminiCLI:
 
         if args.read_chat_id:
             try:
-                info = self.client.get_chat_info(args.read_chat_id)
-                if info:
-                    print(json.dumps({"ok": True, "chat": {"cid": info.cid, "title": info.title}}))
+                history = await self.client.read_chat(args.read_chat_id, limit=args.limit)
+                if history:
+                    turns = [{"role": t.role, "text": t.text} for t in history.turns]
+                    print(json.dumps({"ok": True, "chat": {"cid": history.cid, "turns": turns, "total": len(turns)}}, ensure_ascii=False))
                 else:
                     fail("CHAT_NOT_FOUND", f"Chat {args.read_chat_id} not found.")
             except Exception as e: fail("READ_CHAT_FAILED", str(e))

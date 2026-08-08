@@ -686,11 +686,11 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             try:
                 client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
                 await client.init()
-                info = await client.get_chat_info(args.read_chat_id)
-                if info:
+                history = await client.read_chat(args.read_chat_id, limit=args.limit)
+                if history:
+                    turns = [{"role": t.role, "text": t.text} for t in history.turns]
                     print(json.dumps({"ok": True, "chat": {
-                        "cid": info.cid, "title": info.title,
-                        "updated": info.updated, "model": info.model}}))
+                        "cid": history.cid, "turns": turns, "total": len(turns)}}, ensure_ascii=False))
                 else:
                     fail("CHAT_NOT_FOUND", f"Chat {args.read_chat_id} not found.")
             except Exception as e:
