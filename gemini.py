@@ -1099,42 +1099,53 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                     self.log(f"Saved {len(saved)} image(s) to {sd}")
 
             # Save generated videos to disk
-            if args.save_videos and videos_out:
-                import urllib.request as _ur
-                sd = Path(args.save_videos)
-                sd.mkdir(parents=True, exist_ok=True)
-                saved = []
-                cookie_str = f"__Secure-1PSID={sid}; __Secure-1PSIDTS={ts}"
-                for i, v in enumerate(videos_out):
-                    try:
-                        fp = sd / f"gemini_video_{i}.mp4"
-                        req = _ur.Request(v["url"], headers={"Cookie": cookie_str})
-                        with _ur.urlopen(req, timeout=60) as resp:
-                            fp.write_bytes(resp.read())
-                        saved.append(str(fp))
-                    except Exception as dl_err:
-                        self.log(f"Video {i} download failed: {dl_err}")
-                if saved:
-                    self.log(f"Saved {len(saved)} video(s) to {sd}")
+            if args.save_videos:
+                if videos_out:
+                    import urllib.request as _ur
+                    sd = Path(args.save_videos)
+                    sd.mkdir(parents=True, exist_ok=True)
+                    saved = []
+                    cookie_str = f"__Secure-1PSID={sid}; __Secure-1PSIDTS={ts}"
+                    for i, v in enumerate(videos_out):
+                        try:
+                            fp = sd / f"gemini_video_{i}.mp4"
+                            req = _ur.Request(v["url"], headers={"Cookie": cookie_str})
+                            with _ur.urlopen(req, timeout=60) as resp:
+                                data = resp.read()
+                                # handle 206 polling placeholder (webapi GeneratedVideo retries)
+                                if len(data) < 100 and b"206" in data[:10]:
+                                    self.log(f"Video {i} still generating (206), skipping")
+                                    continue
+                                fp.write_bytes(data)
+                            saved.append(str(fp))
+                        except Exception as dl_err:
+                            self.log(f"Video {i} download failed: {dl_err}")
+                    if saved:
+                        self.log(f"Saved {len(saved)} video(s) to {sd}")
+                else:
+                    self.log("No videos in response — Veo quota may be limited (3/day Pro, 5/day Ultra) or prompt didn't trigger video. Try --img for images.")
 
             # Save generated media (audio/video) to disk
-            if args.save_media and media_out:
-                import urllib.request as _ur
-                sd = Path(args.save_media)
-                sd.mkdir(parents=True, exist_ok=True)
-                saved = []
-                cookie_str = f"__Secure-1PSID={sid}; __Secure-1PSIDTS={ts}"
-                for i, m in enumerate(media_out):
-                    try:
-                        fp = sd / f"gemini_media_{i}.mp4"
-                        req = _ur.Request(m["url"], headers={"Cookie": cookie_str})
-                        with _ur.urlopen(req, timeout=60) as resp:
-                            fp.write_bytes(resp.read())
-                        saved.append(str(fp))
-                    except Exception as dl_err:
-                        self.log(f"Media {i} download failed: {dl_err}")
-                if saved:
-                    self.log(f"Saved {len(saved)} media file(s) to {sd}")
+            if args.save_media:
+                if media_out:
+                    import urllib.request as _ur
+                    sd = Path(args.save_media)
+                    sd.mkdir(parents=True, exist_ok=True)
+                    saved = []
+                    cookie_str = f"__Secure-1PSID={sid}; __Secure-1PSIDTS={ts}"
+                    for i, m in enumerate(media_out):
+                        try:
+                            fp = sd / f"gemini_media_{i}.mp4"
+                            req = _ur.Request(m["url"], headers={"Cookie": cookie_str})
+                            with _ur.urlopen(req, timeout=60) as resp:
+                                fp.write_bytes(resp.read())
+                            saved.append(str(fp))
+                        except Exception as dl_err:
+                            self.log(f"Media {i} download failed: {dl_err}")
+                    if saved:
+                        self.log(f"Saved {len(saved)} media file(s) to {sd}")
+                else:
+                    self.log("No media in response — try --save-videos for Veo or --save-images for Imagen.")
 
             # Update conversation (skip if temporary)
             if args.temporary:
@@ -1156,6 +1167,9 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 if videos_out: payload["videos"] = videos_out
                 if media_out: payload["media"] = media_out
                 if has_thoughts: payload["thoughts"] = thoughts_text
+                else:
+                    if args.show_thoughts:
+                        self.log("No thoughts returned — model may not provide thinking traces for this prompt/tier (deep research often does).")
                 if args.temporary: payload["temporary"] = True
                 if conv_state: payload["conversation"] = conv_state
                 out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1163,6 +1177,8 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 out_text = text
                 if has_thoughts and args.show_thoughts:
                     out_text += "\n\n## Thoughts\n\n" + thoughts_text
+                elif args.show_thoughts and not has_thoughts:
+                    self.log("No thoughts returned — model may not provide thinking traces for this prompt/tier (deep research often does).")
                 if images_out:
                     out_text += "\n\n## Images\n\n"
                     for i, img in enumerate(images_out):
