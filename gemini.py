@@ -275,6 +275,93 @@ def refresh_auth(preferred: str | None = None) -> tuple:
     if sid: _save_auth_cache(sid, ts)
     return sid, ts
 
+# ── Browser-shaped batchexecute (works around gemini_webapi 2.x header/payload gaps) ──
+# Root cause found 2026-09-01: lib's _batch_execute omits Origin/Referer/X-Same-Domain
+# headers and sends f.req single-wrapped; server then rejects read-RPCs (MaZiqc, hNvQHb,
+# CNgdBe, oMH3Zd...) with [\"e\",4,null,null,NNN]. Browser-shaped POST returns 200.
+_BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+
+class BrowserBatchRPC:
+    """Direct batchexecute client with full browser cookie set + browser-shaped payload."""
+
+    def __init__(self, sid: str, ts: str | None = None):
+        self.sid = sid
+        self.ts = ts
+        self.session = None
+        self.at = None
+        self.bl = ""
+
+    async def init(self):
+        from curl_cffi.requests import AsyncSession
+        import browser_cookie3
+        self.session = AsyncSession(impersonate="chrome145")
+        # Full .google.com cookie set from Firefox (auth needs more than 2 cookies for reads)
+        try:
+            cj = browser_cookie3.firefox()
+            for c in cj:
+                if (c.domain or "") == ".google.com":
+                    self.session.cookies.set(c.name, c.value, domain=".google.com", secure=True)
+        except Exception:
+            pass  # fall back to the 2 core cookies
+        if self.sid and "__Secure-1PSID" not in [c.name for c in self.session.cookies.jar]:
+            self.session.cookies.set("__Secure-1PSID", self.sid, domain=".google.com", secure=True)
+        if self.ts:
+            self.session.cookies.set("__Secure-1PSIDTS", self.ts, domain=".google.com", secure=True)
+        r = await self.session.get("https://gemini.google.com/app", headers={"User-Agent": _BROWSER_UA})
+        m = re.search(r'"SNlM0e":"(.*?)"', r.text)
+        self.at = m.group(1) if m else None
+        mb = re.search(r'"cfb2h":"(.*?)"', r.text)
+        self.bl = mb.group(1) if mb else ""
+        if not self.at:
+            raise RuntimeError("AUTH_EXPIRED: no SNlM0e in /app HTML (not signed in?)")
+        return self
+
+    async def rpc(self, rpcid: str, payload, retries: int = 2):
+        from urllib.parse import urlencode
+        freq = json.dumps([[["%s" % rpcid, payload if isinstance(payload, str) else json.dumps(payload), None, "generic"]]])
+        body = urlencode({
+            "rpcids": rpcid, "source-path": "/app", "bl": self.bl, "hl": "en",
+            "f.req": freq, "at": self.at,
+        })
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "Origin": "https://gemini.google.com",
+            "Referer": "https://gemini.google.com/app",
+            "X-Same-Domain": "1",
+            "User-Agent": _BROWSER_UA,
+        }
+        last = None
+        for attempt in range(retries + 1):
+            r = await self.session.post(
+                "https://gemini.google.com/_/BardChatUi/data/batchexecute",
+                data=body, headers=headers)
+            if r.status_code == 200 and '["e",4' not in r.text[:2000]:
+                return r.text
+            last = r
+            if attempt < retries:
+                await asyncio.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"RPC {rpcid} failed: HTTP {last.status_code} {last.text[:120]}")
+
+    async def close(self):
+        try: await self.session.close()
+        except Exception: pass
+
+def _extract_rpc_payloads(rpc_text: str, rpcid: str) -> list:
+    """Pull inner JSON payloads for target rpcid from batchexecute response."""
+    from gemini_webapi.utils.parsing import extract_json_from_response, get_nested_value
+    out = []
+    try:
+        for part in extract_json_from_response(rpc_text):
+            if get_nested_value(part, [1]) != rpcid:
+                continue
+            body = get_nested_value(part, [2])
+            if not body: continue
+            try: out.append(json.loads(body))
+            except (json.JSONDecodeError, TypeError): continue
+    except Exception: pass
+    return out
+
 # ── Image detection ──────────────────────────────────────────
 
 _IMG_GEN_STARTS = ["generate an image", "create an image", "make an image",
@@ -623,14 +710,32 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             else:
                 fail("NO_PROMPT", "Provide system prompt via -p, -S, stdin, or positional args.")
             sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            gem_id_out = None
             try:
-                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
-                await client.init()
-                gem = await client.create_gem(
-                    name=args.create_gem_name, prompt=sys_prompt,
-                    description=f"Hermes task-specific Gem: {args.create_gem_name}")
+                try:
+                    client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                    await client.init()
+                    gem = await client.create_gem(
+                        name=args.create_gem_name, prompt=sys_prompt,
+                        description=f"Hermes task-specific Gem: {args.create_gem_name}")
+                    gem_id_out = gem.id
+                except Exception as lib_err:
+                    # Fallback: browser-shaped RPC (lib headers get e,4 rejections)
+                    rpc = await BrowserBatchRPC(sid, ts).init()
+                    try:
+                        payload = json.dumps([[args.create_gem_name,
+                            f"Hermes task-specific Gem: {args.create_gem_name}",
+                            sys_prompt, None, None, None, None, None, 0, None, 1,
+                            None, None, None, []]])
+                        text = await rpc.rpc("oMH3Zd", payload)
+                        pl = _extract_rpc_payloads(text, "oMH3Zd")
+                        gem_id_out = pl[0][0] if pl and pl[0] else None
+                        if not gem_id_out:
+                            raise RuntimeError(f"no gem id in response ({lib_err})")
+                    finally:
+                        await rpc.close()
                 print(json.dumps({"ok": True, "action": "create-gem",
-                                  "id": gem.id, "name": gem.name}))
+                                  "id": gem_id_out, "name": args.create_gem_name}))
             except Exception as e:
                 fail("GEM_CREATE_FAILED", str(e))
             return
@@ -664,9 +769,17 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         if args.delete_gem_id:
             sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
             try:
-                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
-                await client.init()
-                await client.delete_gem(args.delete_gem_id)
+                try:
+                    client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                    await client.init()
+                    await client.delete_gem(args.delete_gem_id)
+                except Exception:
+                    # Fallback: browser-shaped RPC DELETE_BOT UXcSJb
+                    rpc = await BrowserBatchRPC(sid, ts).init()
+                    try:
+                        await rpc.rpc("UXcSJb", json.dumps([args.delete_gem_id, [0, None, 0]]))
+                    finally:
+                        await rpc.close()
                 print(json.dumps({"ok": True, "action": "delete-gem", "id": args.delete_gem_id}))
             except Exception as e:
                 fail("GEM_DELETE_FAILED", str(e))
@@ -687,14 +800,24 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         if args.list_chats:
             sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
             try:
-                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
-                await client.init()
-                chats = client.list_chats()
-                if chats is None:
-                    fail("LIST_CHATS_FAILED", "No recent chats available (session not initialized).")
-                chat_list = [{"cid": c.cid, "title": c.title, "updated": getattr(c, 'updated', '')}
-                             for c in chats[:args.limit]]
-                print(json.dumps({"ok": True, "chats": chat_list, "total": len(chat_list)}))
+                # gemini_webapi list_chats returns empty (missing headers); use browser-shaped RPC
+                rpc = await BrowserBatchRPC(sid, ts).init()
+                try:
+                    text = await rpc.rpc("MaZiqc", [args.limit, None, [0, None, 1]])
+                    payloads = _extract_rpc_payloads(text, "MaZiqc")
+                    chats = []
+                    for pb in payloads:
+                        # shape: [null, "<pageToken>", [[cid, title, ...], ...]] — chats at pb[2]
+                        if not (isinstance(pb, list) and len(pb) > 2 and isinstance(pb[2], list)):
+                            continue
+                        for cd in pb[2]:
+                            if isinstance(cd, list) and cd and isinstance(cd[0], str) and cd[0].startswith("c_"):
+                                cid, title = cd[0], (cd[1] if isinstance(cd[1], str) else "") or ""
+                                if not any(x["cid"] == cid for x in chats):
+                                    chats.append({"cid": cid, "title": title})
+                    print(json.dumps({"ok": True, "chats": chats[:args.limit], "total": len(chats)}))
+                finally:
+                    await rpc.close()
             except Exception as e:
                 fail("LIST_CHATS_FAILED", str(e))
             return
@@ -703,15 +826,45 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         if args.read_chat_id:
             sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
             try:
-                client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
-                await client.init()
-                history = await client.read_chat(args.read_chat_id, limit=args.limit)
-                if history:
-                    turns = [{"role": t.role, "text": t.text} for t in history.turns]
-                    print(json.dumps({"ok": True, "chat": {
-                        "cid": history.cid, "turns": turns, "total": len(turns)}}, ensure_ascii=False))
-                else:
-                    fail("CHAT_NOT_FOUND", f"Chat {args.read_chat_id} not found.")
+                # lib read_chat first; on failure fall back to browser-shaped hNvQHb RPC
+                try:
+                    client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                    await client.init()
+                    history = await client.read_chat(args.read_chat_id, limit=args.limit)
+                    if history and history.turns:
+                        turns = [{"role": t.role, "text": t.text} for t in history.turns]
+                        print(json.dumps({"ok": True, "chat": {
+                            "cid": history.cid, "turns": turns, "total": len(turns)}}, ensure_ascii=False))
+                        return
+                    raise RuntimeError("lib read_chat empty — falling back")
+                except (SystemExit,):
+                    raise
+                except Exception:
+                    pass
+                rpc = await BrowserBatchRPC(sid, ts).init()
+                try:
+                    text = await rpc.rpc("hNvQHb", [args.read_chat_id, args.limit, None, 1, [1], [4], None, 1])
+                    payloads = _extract_rpc_payloads(text, "hNvQHb")
+                    turns = []
+                    for pb in payloads:
+                        for conv_turn in (pb[0] if pb and isinstance(pb[0], list) else []):
+                            if not isinstance(conv_turn, list): continue
+                            user_text = ""
+                            try: user_text = conv_turn[2][0][0] or ""
+                            except Exception: pass
+                            model_text = ""
+                            try: model_text = conv_turn[3][0][0][1][0] or ""
+                            except Exception: pass
+                            if user_text: turns.append({"role": "user", "text": user_text})
+                            if model_text: turns.append({"role": "model", "text": model_text[:4000]})
+                    if turns:
+                        print(json.dumps({"ok": True, "chat": {"cid": args.read_chat_id, "turns": len(turns)}}))
+                        for t in turns:
+                            print(json.dumps(t, ensure_ascii=False))
+                    else:
+                        fail("CHAT_NOT_FOUND", f"Chat {args.read_chat_id} not found or empty.")
+                finally:
+                    await rpc.close()
             except Exception as e:
                 fail("READ_CHAT_FAILED", str(e))
             return
@@ -768,6 +921,17 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         standalone = args.list_models or args.list_gems
         if standalone and not args.url:
             args.url = "setup"
+
+        # If no Gem URL given but positional words exist, they are the prompt, not a URL.
+        # (parse_intermixed_args dumps all positionals into args.url first.)
+        if not args.gem_id and args.url and args.prompt:
+            pass  # url + separate prompt words — keep as-is
+        elif not args.gem_id and args.url and not args.prompt_flag \
+                and not (args.url.startswith(("http://", "https://"))
+                         or re.fullmatch(r"[A-Za-z0-9_-]{5,20}", args.url or "")):
+            # multi-word or sentence-like positional = prompt text
+            args.prompt = args.url.split() + list(args.prompt)
+            args.url = None
 
         if args.gem_id:
             gem_id = args.gem_id
@@ -1033,6 +1197,10 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                     if attempt == max_attempts - 1: fail("AUTH_EXPIRED", err_msg)
                     self.log("Auth expired, re-scanning...")
                     new_sid, new_ts = refresh_auth(args.browser or os.getenv("GEMINI_BROWSER"))
+                    if not new_sid:
+                        # Fallback: pull straight from the auth cache if it differs
+                        c_sid, c_ts = _load_auth_cache()
+                        new_sid, new_ts = (c_sid, c_ts) if c_sid else (None, None)
                     if new_sid:
                         sid, ts = new_sid, new_ts
                         self.client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
