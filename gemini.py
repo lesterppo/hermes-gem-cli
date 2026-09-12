@@ -11,7 +11,7 @@ Output: {"ok":true,"f":"./out.md","s":1234,"b":2,"imgs":3,
 
 Repo: lesterppo/hermes-gem-cli (primary), lesterppo/gemini-web-cli (historical)
 """
-import asyncio, argparse, json, os, re, sys, time, webbrowser
+import asyncio, argparse, json, os, re, subprocess, sys, time, webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -225,9 +225,65 @@ def _save_auth_cache(sid: str, ts: str | None):
         "updated": datetime.now(timezone.utc).isoformat(),
     }))
 
-def _scan_browser_cookies(preferred: str | None = None) -> tuple:
+def _cdp_cookies(cdp_url: str | None = None) -> tuple:
+    """Live cookies from an already-running CDP browser.
+
+    This is the preferred source: no browser launch (the daemon is already up),
+    no user action, no decryption of the browser's on-disk cookie DB. Run in a
+    subprocess because the sync Playwright API cannot start inside a running
+    asyncio loop, and gemini.py drives its client from one.
+    """
+    url = (cdp_url or os.getenv("GEMINI_CDP_URL") or os.getenv("GEM_PW_CDP")
+           or "http://127.0.0.1:9223")
+    if os.getenv("GEMINI_NO_CDP"):
+        return None, None
+    snippet = (
+        "import json,sys\n"
+        "try:\n"
+        "    from playwright.sync_api import sync_playwright\n"
+        "except ImportError:\n"
+        "    print('{}'); raise SystemExit\n"
+        "out={'sid':None,'ts':None}\n"
+        "try:\n"
+        "    with sync_playwright() as p:\n"
+        "        b=p.chromium.connect_over_cdp(sys.argv[1], timeout=8000)\n"
+        "        for ctx in b.contexts:\n"
+        "            try: cks=ctx.cookies('https://gemini.google.com')\n"
+        "            except Exception: continue\n"
+        "            for c in cks:\n"
+        "                if c['name']=='__Secure-1PSID': out['sid']=c['value']\n"
+        "                elif c['name']=='__Secure-1PSIDTS': out['ts']=c['value']\n"
+        "            if out['sid']: break\n"
+        "except Exception:\n"
+        "    pass\n"
+        "print(json.dumps(out))\n"
+    )
+    try:
+        r = subprocess.run([sys.executable, "-c", snippet, url],
+                           capture_output=True, text=True, timeout=30)
+        d = json.loads((r.stdout or "").strip().splitlines()[-1])
+        if d.get("sid"):
+            return d["sid"], d.get("ts")
+    except Exception:
+        pass
+    return None, None
+
+
+# Which source produced the currently-resolved credential pair. Surfaced so a
+# failure is diagnosable instead of "it just stopped working".
+_LAST_AUTH_SRC = None
+
+
+def _local_browser_candidates(preferred: str | None = None) -> list:
+    """EVERY local browser profile that holds a 1PSID, not just the first hit.
+
+    Returning only the first is why a dead Chrome profile could shadow a live
+    Firefox one: nothing else was ever enumerated, so recovery had nothing to
+    fall back to.
+    """
+    out = []
     try: import browser_cookie3
-    except ImportError: return None, None
+    except ImportError: return out
     order = [('chrome', browser_cookie3.chrome), ('firefox', browser_cookie3.firefox),
              ('edge', browser_cookie3.edge), ('safari', browser_cookie3.safari)]
     if preferred:
@@ -241,9 +297,112 @@ def _scan_browser_cookies(preferred: str | None = None) -> tuple:
             for c in cj:
                 if c.name == '__Secure-1PSID': sid = c.value
                 elif c.name == '__Secure-1PSIDTS': ts = c.value
-            if sid: return sid, ts
-        except Exception: continue
+            if sid:
+                out.append((f"browser:{name}", sid, ts))
+        except Exception:
+            continue
+    return out
+
+
+def _scan_local_browsers(preferred: str | None = None) -> tuple:
+    global _LAST_AUTH_SRC
+    for src, sid, ts in _local_browser_candidates(preferred):
+        _LAST_AUTH_SRC = src
+        return sid, ts
     return None, None
+
+
+def _scan_browser_cookies(preferred: str | None = None) -> tuple:
+    """Local browser cookie DBs first, CDP browser as the fallback source.
+
+    Ordering matters: a browser holding cookies is NOT proof the session is still
+    valid server-side. The CDP profile in particular can sit on a dead session
+    (Google invalidates it long before the cookie's nominal expiry), so it must
+    never outrank a local profile that is actually working.
+    """
+    sid, ts = _scan_local_browsers(preferred)
+    if sid:
+        return sid, ts
+    sid, ts = _cdp_cookies()
+    if sid:
+        globals()["_LAST_AUTH_SRC"] = "cdp"
+    return sid, ts
+
+
+def _auth_candidates(preferred: str | None = None) -> list:
+    """Every DISTINCT credential pair available, with its source label.
+
+    Distinctness is by 1PSID: the same session reached through two sources is one
+    candidate, so the retry path never burns an attempt on a duplicate.
+    """
+    out = []
+
+    def add(src, sid, ts):
+        if sid and all(c[1] != sid for c in out):
+            out.append((src, sid, ts))
+
+    add("env", os.getenv("GEMINI_SID"), os.getenv("GEMINI_TS"))
+    c_sid, c_ts = _load_auth_cache()
+    add("cache", c_sid, c_ts)
+    for src, sid, ts in _local_browser_candidates(preferred):
+        add(src, sid, ts)
+    d_sid, d_ts = _cdp_cookies()
+    add("cdp", d_sid, d_ts)
+    return out
+
+
+# Credentials already proven dead this process. Tracking the whole set (not just
+# the most recent failure) stops recovery from oscillating between two stale
+# sources until the attempt budget runs out.
+_FAILED_SIDS = set()
+
+
+def _next_auth(failed_sid: str | None, preferred: str | None = None) -> tuple:
+    """Next credential that has not already failed in this process.
+
+    Retrying a known-dead pair is a guaranteed failure dressed up as recovery.
+    """
+    if failed_sid:
+        _FAILED_SIDS.add(failed_sid)
+    for src, sid, ts in _auth_candidates(preferred):
+        if sid in _FAILED_SIDS:
+            continue
+        globals()["_LAST_AUTH_SRC"] = src
+        return sid, ts
+    return None, None
+
+def _validate_auth(sid: str, ts: str | None = None, timeout: int = 20) -> bool:
+    """Cheap real check: does gemini.google.com/app hand back a session token?
+
+    Holding a cookie is not evidence the session is alive server-side, and the
+    only reliable way to tell the difference is to ask the server.
+    """
+    if not sid:
+        return False
+    try:
+        import urllib.request
+        req = urllib.request.Request("https://gemini.google.com/app", headers={
+            "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"),
+            "Cookie": f"__Secure-1PSID={sid}" + (f"; __Secure-1PSIDTS={ts}" if ts else ""),
+            "Accept-Language": "en",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return "SNlM0e" in r.read(400000).decode("utf-8", "replace")
+    except Exception:
+        return False
+
+
+def _init_validated(preferred: str | None = None) -> tuple:
+    """Save the first candidate that actually authenticates. Returns (src, sid, ts)."""
+    cands = _auth_candidates(preferred)
+    for src, sid, ts in cands:
+        if _validate_auth(sid, ts):
+            _save_auth_cache(sid, ts)
+            globals()["_LAST_AUTH_SRC"] = src
+            return src, sid, ts
+    return None, None, None
+
 
 def _browser_login(preferred: str | None = None) -> tuple:
     if not sys.stdout.isatty(): return None, None
@@ -579,12 +738,23 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             self.log("Extracting auth tokens from browser...")
             sid = os.getenv("GEMINI_SID")
             ts = os.getenv("GEMINI_TS")
-            if not sid: sid, ts = _scan_browser_cookies(preferred=args.browser or os.getenv("GEMINI_BROWSER"))
             if sid:
                 _save_auth_cache(sid, ts)
-                print(json.dumps({"ok": True, "action": "init", "cached": str(AUTH_CACHE)}))
+                print(json.dumps({"ok": True, "action": "init", "cached": str(AUTH_CACHE),
+                                  "auth_src": "env", "sid_len": len(sid)}))
+                return
+            # Validate before saving: a profile that merely HOLDS cookies may be
+            # sitting on a session Google already invalidated.
+            src, sid, ts = _init_validated(args.browser or os.getenv("GEMINI_BROWSER"))
+            if sid:
+                print(json.dumps({"ok": True, "action": "init", "cached": str(AUTH_CACHE),
+                                  "auth_src": src, "validated": True, "sid_len": len(sid)}))
             else:
-                fail("AUTH_EXPIRED", "No cookies found. Sign in at gemini.google.com first, or use --login.")
+                fail("AUTH_EXPIRED",
+                     "No candidate authenticated. Sign in at gemini.google.com in a local "
+                     "browser (or start the CDP browser signed in), then re-run --init.",
+                     {"candidates_tried": [s for s, _, _ in _auth_candidates()],
+                      "retry": False})
             return
 
         # ── Standalone: --login ──
@@ -1194,18 +1364,28 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             except Exception as e:
                 err_msg = str(e); kind = error_kind(err_msg)
                 if kind == "AUTH_EXPIRED":
-                    if attempt == max_attempts - 1: fail("AUTH_EXPIRED", err_msg)
-                    self.log("Auth expired, re-scanning...")
-                    new_sid, new_ts = refresh_auth(args.browser or os.getenv("GEMINI_BROWSER"))
-                    if not new_sid:
-                        # Fallback: pull straight from the auth cache if it differs
-                        c_sid, c_ts = _load_auth_cache()
-                        new_sid, new_ts = (c_sid, c_ts) if c_sid else (None, None)
+                    if attempt == max_attempts - 1:
+                        fail("AUTH_EXPIRED", err_msg,
+                             {"auth_src": _LAST_AUTH_SRC, "retry": False})
+                    self.log(f"Auth expired (src={_LAST_AUTH_SRC}), trying next distinct source...")
+                    new_sid, new_ts = _next_auth(sid, args.browser or os.getenv("GEMINI_BROWSER"))
+                    # Never retry with the identical pair that just failed: that is a
+                    # guaranteed second failure dressed up as recovery. Take the next
+                    # DISTINCT credential, or stop with an actionable message.
                     if new_sid:
                         sid, ts = new_sid, new_ts
                         self.client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
                         await self.client.init()
+                        # Converge the cache onto the credential that actually works, so
+                        # later runs skip the walk instead of starting from a dead source.
+                        try: _save_auth_cache(sid, ts)
+                        except Exception: pass
                         continue
+                    fail("AUTH_EXPIRED",
+                         "session is dead and no other source holds a distinct credential. "
+                         "Sign in at gemini.google.com in a local browser, then retry. "
+                         f"(last source used: {_LAST_AUTH_SRC})",
+                         {"auth_src": _LAST_AUTH_SRC, "recovered": False, "retry": False})
                 if kind == "RATE_LIMIT":
                     wait = 30 if attempt == 0 else 60
                     if attempt == max_attempts - 1:
