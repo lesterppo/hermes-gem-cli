@@ -151,6 +151,14 @@ class TestArgSurface(unittest.TestCase):
         self.assertIn("fetch_latest_chat_response", src)
         self.assertNotIn("get_deep_research_status", src)   # method never existed
 
+    def test_read_chat_emits_conversation_order(self):
+        """The library returns turns NEWEST-first; the CLI must reverse whole turn
+        pairs (flattened reversal would swap user/model inside each turn)."""
+        src = inspect.getsource(g.GeminiCLI.run)
+        self.assertIn("reversed(history.turns)", src)
+        self.assertIn("reversed(pairs)", src)
+        self.assertIn('"order": "oldest-first"', src)
+
 
 class TestImportSafety(unittest.TestCase):
     def test_import_without_optional_deps_does_not_exit(self):

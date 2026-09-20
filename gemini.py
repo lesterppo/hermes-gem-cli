@@ -1211,9 +1211,12 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                     await client.init()
                     history = await client.read_chat(args.read_chat_id, limit=args.limit)
                     if history and history.turns:
-                        turns = [{"role": t.role, "text": t.text} for t in history.turns]
+                        # The library returns turns NEWEST-FIRST; emit conversation
+                        # order (oldest-first) so a reader can follow it, and say so.
+                        turns = [{"role": t.role, "text": t.text} for t in reversed(history.turns)]
                         print(json.dumps({"ok": True, "chat": {
-                            "cid": history.cid, "turns": turns, "total": len(turns)}}, ensure_ascii=False))
+                            "cid": history.cid, "turns": turns, "total": len(turns),
+                            "order": "oldest-first"}}, ensure_ascii=False))
                         return
                     raise RuntimeError("lib read_chat empty — falling back")
                 except (SystemExit,):
@@ -1224,7 +1227,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 try:
                     text = await rpc.rpc("hNvQHb", [args.read_chat_id, args.limit, None, 1, [1], [4], None, 1])
                     payloads = _extract_rpc_payloads(text, "hNvQHb")
-                    turns = []
+                    pairs = []          # one (user, model) pair per conv turn
                     for pb in payloads:
                         for conv_turn in (pb[0] if pb and isinstance(pb[0], list) else []):
                             if not isinstance(conv_turn, list): continue
@@ -1234,10 +1237,18 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                             model_text = ""
                             try: model_text = conv_turn[3][0][0][1][0] or ""
                             except Exception: pass
-                            if user_text: turns.append({"role": "user", "text": user_text})
-                            if model_text: turns.append({"role": "model", "text": model_text[:4000]})
+                            pair = []
+                            if user_text: pair.append({"role": "user", "text": user_text})
+                            if model_text: pair.append({"role": "model", "text": model_text[:4000]})
+                            if pair: pairs.append(pair)
+                    # hNvQHb serves newest-first (same as the library's parser), so
+                    # reverse whole TURN pairs — reversing the flattened list would
+                    # swap the user/model order inside every turn.
+                    turns = [t for pair in reversed(pairs) for t in pair]
                     if turns:
-                        print(json.dumps({"ok": True, "chat": {"cid": args.read_chat_id, "turns": len(turns)}}))
+                        print(json.dumps({"ok": True, "chat": {
+                            "cid": args.read_chat_id, "turns": len(turns),
+                            "order": "oldest-first"}}))
                         for t in turns:
                             print(json.dumps(t, ensure_ascii=False))
                     else:
