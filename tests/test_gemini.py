@@ -152,5 +152,23 @@ class TestArgSurface(unittest.TestCase):
         self.assertNotIn("get_deep_research_status", src)   # method never existed
 
 
+class TestImportSafety(unittest.TestCase):
+    def test_import_without_optional_deps_does_not_exit(self):
+        """The CLI exits(1) with DEP_MISSING when run without gemini-webapi, but
+        importing the module for tooling/tests must not kill the process."""
+        import subprocess
+        code = (
+            "import sys, importlib.util\n"
+            "sys.modules['gemini_webapi'] = None\n"
+            "sys.modules['gemini_webapi.client'] = None\n"
+            "spec = importlib.util.spec_from_file_location('g2', %r)\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "print('SURVIVED', m.GeminiClient is None)\n" % str(ROOT / "gemini.py")
+        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertIn("SURVIVED True", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

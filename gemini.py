@@ -82,13 +82,21 @@ try:
     from gemini_webapi import GeminiClient
     from gemini_webapi.client import Model as GeminiModel
 except ImportError:
-    print(json.dumps({"ok": False, "err": "DEP_MISSING",
-                       "msg": "gemini-webapi not installed. Run: pip install gemini-webapi"}))
-    sys.exit(1)
+    # Exiting here is right for the CLI, but it also kills anything that merely
+    # IMPORTS this module (tests, tooling) — so only the entry point exits.
+    if __name__ == "__main__":
+        print(json.dumps({"ok": False, "err": "DEP_MISSING",
+                          "msg": "gemini-webapi not installed. Run: pip install gemini-webapi"}))
+        sys.exit(1)
+    GeminiClient = None
+    GeminiModel = None
 
-import loguru as _loguru
-_loguru.logger.remove()
-_loguru.logger.add(sys.stderr, level="ERROR", format="<red>[gemini]</red> {message}")
+try:
+    import loguru as _loguru
+    _loguru.logger.remove()
+    _loguru.logger.add(sys.stderr, level="ERROR", format="<red>[gemini]</red> {message}")
+except ImportError:                                   # optional at import time
+    _loguru = None
 
 # ── Paths ────────────────────────────────────────────────────
 
