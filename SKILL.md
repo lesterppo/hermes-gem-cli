@@ -1,7 +1,7 @@
 ---
 name: gem-cli
-description: AI-agent-native CLI for shared Gemini Gems via URL.
-version: 4.0.0
+description: AI-agent-native CLI for shared Gemini Gems via URL. Live session selection + --doctor auth diagnostics.
+version: 4.1.0
 author: Peter (lesterppo)
 license: MIT
 tags: [gemini, gem, cli, agent-native, token-efficient]

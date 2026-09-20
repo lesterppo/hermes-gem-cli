@@ -56,8 +56,47 @@ requests (~4s chat). This is 3-10x faster than browser automation.
 | Video generation | `--save-videos DIR` | Veo 3, 3/day Pro |
 | Canvas artifact | `--extract-canvas FILE` | saves html block |
 | Fetch latest | `--fetch-latest c_xxx` | fast latest turn |
-| Deep research status | `--deep-research-status ID` | poll by ID |
+| Deep research status | `--deep-research-status c_xxx` | is the report in the chat yet? |
+| Auth diagnostics | `--doctor` | which cookie jar is live + capability probe |
 | Streaming output | `--stream` | real-time tokens |
+
+### Fixed in 4.1 (live-verified 2026-09-20)
+
+A cookie *pair* can be chat-valid while being read-invalid: StreamGenerate answers
+(so chat "works") while every SNlM0e-gated call — Gem CRUD, `--list-gems`,
+`--list-chats`, `--account-status` — fails. Two root causes, both fixed:
+
+1. **Stale cache shadowed the live browser session.** `resolve_auth()` returned
+   `~/.gemini-cli/auth.json` without validating it, so Gem CRUD died with
+   `AUTH_EXPIRED: no SNlM0e in /app HTML` and `--list-gems` returned
+   `Permission denied … UNAUTHENTICATED` even though the browser session was fine.
+   Candidates are now probed once per run with a cheap `/app` request and the first
+   live one wins (falling back to the old behaviour only if none is live).
+2. **Mixed cookie jars.** The browser-shaped batchexecute client took the full jar
+   from Firefox and then overwrote `__Secure-1PSIDTS` with the *cache's* value —
+   a jar assembled from two sessions that the server treats as signed out. The jar
+   is now taken whole from one source that owns the selected `1PSID`.
+
+Also fixed: `--list-gems`/`--gem-info` fall back to the browser-shaped `LIST_BOTS`
+RPC; `--deep-research-status` takes a CHAT id (there is no research-task entity to
+look up) and reports whether the report has landed; the pointer's `model` field says
+`default` instead of `None` when no `-m` was given; an unresolvable Gem id fails once
+with a clear message instead of retrying into a longer hang.
+
+### Pitfalls worth knowing (they cost real debugging time)
+
+- **A chat-valid cookie pair is not a valid session for reads.** StreamGenerate
+  accepts the pair even when the session is degraded, so chat keeps working while
+  Gem CRUD / `--list-gems` / `--list-chats` fail. `--doctor` tells you which source
+  is live; `resolve_auth()` now prefers it automatically.
+- **Never assemble a cookie jar from two sessions** (1PSID from one source plus
+  1PSIDTS from another is treated as signed out).
+- **`gemini_webapi`'s deep-research entry points have no `on_status` hook** —
+  passing it raises `TypeError`, which the fallback chain swallowed, so every DR run
+  silently degraded to a plain `generate_content` call.
+- **An unresolvable Gem id hangs rather than 404s**; unresolved ids now get one
+  capped 60s attempt with a message naming both causes (typo vs. inaccessible shared Gem).
+- Tests are offline: `python3 -m pytest tests/ -q` (network + cookie stores stubbed).
 
 ## Install
 

@@ -140,6 +140,8 @@ _MODEL_LABEL_MAP = {
     "ADVANCED_THINKING": "thinking+extended",
     "gemini-3-flash": "flash", "gemini-3-pro": "pro",
     "gemini-3-flash-lite": "lite", "gemini-3.5-flash-lite": "lite",
+    "Flash-Lite": "lite", "gemini-flash-lite": "lite",
+    "gemini-flash": "flash", "gemini-pro": "pro",
     "gemini-3-flash-thinking": "thinking", "3.5 Flash-Lite": "lite",
 }
 
@@ -158,6 +160,10 @@ _THINKING_ALIASES = {"standard": "BASIC", "basic": "BASIC",
                       "plus": "PLUS", "extended": "ADVANCED", "advanced": "ADVANCED"}
 
 def friendly_model_label(model) -> str:
+    # No -m: the account default is used, and "None" in the pointer read like a bug
+    # (it was one). Say what actually happened instead.
+    if model is None:
+        return "default"
     if isinstance(model, dict):
         return _MODEL_LABEL_MAP.get(model.get("model_name", ""), model.get("model_name", "lite"))
     if hasattr(model, 'name'):
@@ -165,6 +171,15 @@ def friendly_model_label(model) -> str:
     if isinstance(model, str):
         return _MODEL_LABEL_MAP.get(model, model.lower())
     return str(model)
+
+def _supports(fn, param: str) -> bool:
+    """True when a library callable accepts `param` (lib versions drift)."""
+    try:
+        import inspect
+        return param in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
 
 def resolve_model_enum(model_str: str | None, thinking: str | None = None):
     if not model_str: return None
@@ -415,19 +430,107 @@ def _browser_login(preferred: str | None = None) -> tuple:
             _save_auth_cache(sid, ts); return sid, ts
     return None, None
 
+# ── Session liveness ─────────────────────────────────────────
+# A cookie PAIR can be chat-valid while being read-invalid: StreamGenerate accepts
+# it (chat works, which is why this went unnoticed) but every SNlM0e-gated call —
+# Gem CRUD, --list-gems, --list-chats, /app reads, account status — is rejected.
+# Keep a per-process probe verdict so preferring a live credential costs one
+# request per session at most.
+_PROBE_CACHE: dict = {}
+_WARNED_NO_LIVE = [False]
+
+
+def _probe_live(sid: str, ts: str | None) -> bool:
+    if not sid:
+        return False
+    if sid not in _PROBE_CACHE:
+        _PROBE_CACHE[sid] = _validate_auth(sid, ts)
+    return _PROBE_CACHE[sid]
+
+
+def _browser_cookie_jars(preferred: str | None = None) -> list:
+    """Every browser's FULL .google.com jar, labelled (preferred browser first).
+
+    Full jars matter: the /app page hands back SNlM0e only when the rotating
+    suite of cookies (SID/SAPISID/__Secure-1PAPISID/...) accompanies the pair.
+    """
+    try:
+        import browser_cookie3
+    except ImportError:
+        return []
+    order = [("chrome", browser_cookie3.chrome), ("firefox", browser_cookie3.firefox),
+             ("edge", browser_cookie3.edge), ("safari", browser_cookie3.safari)]
+    if preferred:
+        for i, (n, _) in enumerate(order):
+            if n == preferred.lower():
+                order.insert(0, order.pop(i)); break
+    out = []
+    for name, fn in order:
+        try:
+            jar = {c.name: c.value for c in fn(domain_name=".google.com")}
+        except Exception:
+            continue
+        if jar.get("__Secure-1PSID"):
+            out.append((f"browser:{name}", jar))
+    return out
+
+
+def _cookie_jar_for(sid: str | None, preferred: str | None = None) -> tuple:
+    """The full cookie jar that BELONGS to `sid` — never a mix of two sessions.
+
+    Mixing a 1PSID from one source with a 1PSIDTS from another yields a jar the
+    server treats as signed out; that single mistake is what broke --list-chats
+    and --read-chat while chat kept working.
+    """
+    jars = _browser_cookie_jars(preferred)
+    for src, jar in jars:
+        if sid and jar.get("__Secure-1PSID") == sid:
+            return src, jar
+    if jars:
+        return jars[0][0], jars[0][1]
+    return "credential", {}
+
+
 def resolve_auth(preferred_browser: str | None = None, allow_login: bool = False) -> tuple:
+    """Pick a credential pair, preferring one whose session is actually live.
+
+    Order is unchanged (env → cache → browsers → CDP) but a candidate has to pass
+    the cheap /app probe before it wins; if none does, the first available pair is
+    returned anyway so chat still has a chance. Without this, a stale cache entry
+    silently shadowed the live browser session and every read/Gem-CRUD call failed.
+    """
+    global _LAST_AUTH_SRC
     sid = os.getenv("GEMINI_SID"); ts = os.getenv("GEMINI_TS")
-    if sid: return sid, ts
-    sid, ts = _load_auth_cache()
-    if sid: return sid, ts
-    sid, ts = _scan_browser_cookies(preferred=preferred_browser)
-    if sid: _save_auth_cache(sid, ts); return sid, ts
-    if allow_login:
+    if sid:
+        _LAST_AUTH_SRC = "env"
+        return sid, ts
+
+    cands = _auth_candidates(preferred_browser)
+    if not cands and allow_login:
         sid, ts = _browser_login(preferred=preferred_browser)
-        if sid: return sid, ts
-    print(json.dumps({"ok": False, "err": "AUTH_EXPIRED",
-                       "msg": "No Gemini cookies. Set GEMINI_SID/TS, run --init, or --login."}))
-    sys.exit(1)
+        if sid:
+            _LAST_AUTH_SRC = "login"
+            return sid, ts
+    if not cands:
+        print(json.dumps({"ok": False, "err": "AUTH_EXPIRED",
+                          "msg": "No Gemini cookies. Set GEMINI_SID/TS, run --init, or --login."}))
+        sys.exit(1)
+
+    for src, c_sid, c_ts in cands:
+        if _probe_live(c_sid, c_ts):
+            if src != "cache":
+                # Promote the live credential so the next run skips the probe tail.
+                _save_auth_cache(c_sid, c_ts)
+            _LAST_AUTH_SRC = src
+            return c_sid, c_ts
+
+    if not _WARNED_NO_LIVE[0]:
+        _WARNED_NO_LIVE[0] = True
+        print("[gemini] warning: no live-session credential found — using the first "
+              "available pair (chat may work; Gem/read APIs will fail)", file=sys.stderr)
+    src, c_sid, c_ts = cands[0]
+    _LAST_AUTH_SRC = src
+    return c_sid, c_ts
 
 def refresh_auth(preferred: str | None = None) -> tuple:
     sid, ts = _scan_browser_cookies(preferred=preferred)
@@ -453,20 +556,26 @@ class BrowserBatchRPC:
 
     async def init(self):
         from curl_cffi.requests import AsyncSession
-        import browser_cookie3
         self.session = AsyncSession(impersonate="chrome145")
-        # Full .google.com cookie set from Firefox (auth needs more than 2 cookies for reads)
-        try:
-            cj = browser_cookie3.firefox()
-            for c in cj:
-                if (c.domain or "") == ".google.com":
-                    self.session.cookies.set(c.name, c.value, domain=".google.com", secure=True)
-        except Exception:
-            pass  # fall back to the 2 core cookies
-        if self.sid and "__Secure-1PSID" not in [c.name for c in self.session.cookies.jar]:
-            self.session.cookies.set("__Secure-1PSID", self.sid, domain=".google.com", secure=True)
-        if self.ts:
-            self.session.cookies.set("__Secure-1PSIDTS", self.ts, domain=".google.com", secure=True)
+        # Consistency beats coverage: take ONE source's full jar. A jar assembled
+        # from two sessions (1PSID from the browser, 1PSIDTS from the cache) is
+        # rejected as signed-out even though both halves are valid on their own.
+        src, jar = _cookie_jar_for(self.sid, os.getenv("GEMINI_BROWSER"))
+        if jar and (not self.sid or jar.get("__Secure-1PSID") == self.sid):
+            use = jar
+        elif jar:
+            use = jar                      # browser session outranks a lone pair
+            print(f"[gemini] browser-shaped RPC: using {src} session "
+                  f"(requested credential had no full jar)", file=sys.stderr)
+        else:
+            use = {}
+        for k, v in use.items():
+            self.session.cookies.set(k, v, domain=".google.com", secure=True)
+        if not use:
+            if self.sid:
+                self.session.cookies.set("__Secure-1PSID", self.sid, domain=".google.com", secure=True)
+            if self.ts:
+                self.session.cookies.set("__Secure-1PSIDTS", self.ts, domain=".google.com", secure=True)
         r = await self.session.get("https://gemini.google.com/app", headers={"User-Agent": _BROWSER_UA})
         m = re.search(r'"SNlM0e":"(.*?)"', r.text)
         self.at = m.group(1) if m else None
@@ -519,6 +628,39 @@ def _extract_rpc_payloads(rpc_text: str, rpcid: str) -> list:
             try: out.append(json.loads(body))
             except (json.JSONDecodeError, TypeError): continue
     except Exception: pass
+    return out
+
+
+async def _fetch_gems_rpc(sid: str, ts: str | None, language: str = "en") -> list:
+    """Gem list via browser-shaped LIST_BOTS (CNgdBe).
+
+    gemini_webapi's fetch_gems() also calls _check_account_status() first, so a
+    stale credential turns a perfectly answerable list request into
+    "Permission denied" — this path skips that gate and needs only a live jar.
+    Two calls, because the endpoint separates predefined (3) from custom (2).
+    """
+    rpc = await BrowserBatchRPC(sid, ts).init()
+    out = []
+    try:
+        for kind, payload in (("system", f"[3,['{language}'],0]"),
+                              ("custom", f"[2,['{language}'],0]")):
+            text = await rpc.rpc("CNgdBe", payload)
+            for pb in _extract_rpc_payloads(text, "CNgdBe"):
+                gems = pb[2] if isinstance(pb, list) and len(pb) > 2 else None
+                if not isinstance(gems, list):
+                    continue
+                for gem in gems:
+                    if not (isinstance(gem, list) and gem and isinstance(gem[0], str)):
+                        continue
+                    meta = gem[1] if len(gem) > 1 and isinstance(gem[1], list) else []
+                    out.append({
+                        "id": gem[0],
+                        "name": (meta[0] if len(meta) > 0 else "") or "",
+                        "description": (meta[1] if len(meta) > 1 else "") or "",
+                        "type": "system" if kind == "system" else "user",
+                    })
+    finally:
+        await rpc.close()
     return out
 
 # ── Image detection ──────────────────────────────────────────
@@ -701,6 +843,8 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         p.add_argument("-l", "--limit", type=int, default=50, help="Limit for list commands")
         # Account
         p.add_argument("--account-status", action="store_true", help="Check account status")
+        p.add_argument("--doctor", action="store_true",
+                       help="Diagnose auth sources (which cookie jar is live) + capability probe")
         # Search Gem
         p.add_argument("--setup-search-gem", action="store_true", help="Create search grounding Gem")
         # Save images/videos/media
@@ -835,15 +979,72 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                     await client.fetch_gems()
                     result["gem_count"] = len(client.gems)
                     if args.list_gems:
-                        result["gems"] = [{"id": gid, "name": g.name} 
+                        result["gems"] = [{"id": gid, "name": g.name}
                                           for gid, g in list(client.gems.items())[:args.limit]]
                 except Exception:
-                    result["gem_count"] = -1
+                    # Stale-but-chat-valid credential: the lib path refuses, the
+                    # browser-shaped LIST_BOTS still answers.
+                    try:
+                        _g = await _fetch_gems_rpc(sid, ts, language=result.get("language") or "en")
+                        result["gem_count"] = len(_g)
+                        if args.list_gems:
+                            result["gems"] = _g[:args.limit]
+                    except Exception:
+                        result["gem_count"] = -1
                 
                 print(json.dumps(result, ensure_ascii=False))
             except Exception as e:
                 fail("ACCOUNT_STATUS_FAILED", str(e))
             return
+
+        # ── Standalone: --doctor ──
+        # Answers "why did that call fail?" in one shot: which credential sources
+        # exist, which of them actually opens /app (SNlM0e), which one would be
+        # chosen, and whether the Gem/read paths work with it.
+        if args.doctor:
+            sources = []
+            for src, c_sid, c_ts in _auth_candidates(args.browser or os.getenv("GEMINI_BROWSER")):
+                entry = {"src": src, "sid": (c_sid or "")[:12], "has_ts": bool(c_ts),
+                         "live": _probe_live(c_sid, c_ts)}
+                if src.startswith("browser:"):
+                    _, jar = _cookie_jar_for(c_sid)
+                    entry["jar_cookies"] = len(jar)
+                sources.append(entry)
+            selected = next((s for s in sources if s["live"]), sources[0] if sources else None)
+            out = {"ok": True, "auth_cache": str(AUTH_CACHE),
+                   "auth_cache_exists": AUTH_CACHE.exists(),
+                   "browser_flag": args.browser or os.getenv("GEMINI_BROWSER") or None,
+                   "sources": sources,
+                   "selected": selected["src"] if selected else None,
+                   "live_available": bool(selected and selected["live"])}
+            sid, ts = (resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+                       if sources else (None, None))
+            if sid:
+                try:
+                    client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
+                    await client.init()
+                    try:
+                        out["models"] = [str(m) for m in client.list_models()]
+                    except Exception:
+                        out["models"] = []
+                    try:
+                        out["account_status"] = client.account_status.name
+                    except Exception:
+                        out["account_status"] = None
+                except Exception as e:
+                    out["init_error"] = str(e)[:200]
+                try:
+                    gems = await _fetch_gems_rpc(sid, ts)
+                    out["gems_via_rpc"] = len(gems)
+                except Exception as e:
+                    out["gems_via_rpc"] = -1
+                    out["gems_rpc_error"] = str(e)[:160]
+            if not out.get("live_available"):
+                out["hint"] = ("No live session found. Sign in at gemini.google.com in a local "
+                               "browser (then rerun with --init), or set GEMINI_SID/GEMINI_TS.")
+            print(json.dumps(out, ensure_ascii=False))
+            return
+
 
         # ── Standalone: --setup-search-gem ──
         if args.setup_search_gem:
@@ -1072,17 +1273,36 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 fail("FETCH_LATEST_FAILED", str(e))
             return
 
-        # ── Standalone: --deep-research-status ──
+        # ── Standalone: --deep-research-status <CID> ──
+        # There is NO research-task entity to look up: Gemini keeps the task id at
+        # the literal "agency-placeholder-task-id" from start to finish and both
+        # task-listing RPCs stay empty (documented in gemini_webapi's
+        # wait_for_deep_research). The only real signal is whether the report has
+        # landed in the conversation, so this takes the CHAT id (the "c" field
+        # printed by --deep-research) and reports that.
         if args.deep_research_status_id:
+            cid = args.deep_research_status_id
             sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
             try:
                 client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
                 await client.init()
-                st = await client.get_deep_research_status(args.deep_research_status_id)
-                if st:
-                    print(json.dumps({"ok": True, "status": st.model_dump() if hasattr(st, "model_dump") else str(st)}, ensure_ascii=False, default=str))
-                else:
-                    fail("RESEARCH_STATUS_FAILED", f"No status for {args.deep_research_status_id}")
+                out = await client.fetch_latest_chat_response(cid)
+                if out is None:
+                    fail("RESEARCH_STATUS_FAILED", f"No turn found for chat {cid}")
+                doc = getattr(out, "deep_research_document", None)
+                text = out.text or ""
+                done = bool(doc) or len(text) > 400
+                res = {"ok": True, "cid": cid,
+                       "status": "completed" if done else "pending",
+                       "chars": len(text), "has_document": bool(doc)}
+                if done and text:
+                    op = Path(args.output) if args.output else Path(
+                        f"/tmp/gemini-dr-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md")
+                    op.write_text(text, encoding="utf-8")
+                    res["f"] = str(op)
+                print(json.dumps(res, ensure_ascii=False))
+            except (SystemExit,):
+                raise
             except Exception as e:
                 fail("RESEARCH_STATUS_FAILED", str(e))
             return
@@ -1143,20 +1363,31 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             if not gem_id:
                 fail("GEM_REQUIRED", "A Gem URL, ID, or -g <id> is required for --gem-info.")
             sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
+            found = None
             try:
                 client = GeminiClient(secure_1psid=sid, secure_1psidts=ts)
                 await client.init()
                 await client.fetch_gems()
                 g = client.gems.get(gem_id)
                 if g:
-                    print(json.dumps({"ok": True, "gem": {
-                        "id": gem_id, "name": g.name, "description": g.description or "",
-                        "type": "system" if g.predefined else "user"}}))
-                else:
-                    print(json.dumps({"ok": True, "gem": {"id": gem_id, "name": "",
-                        "description": "", "type": "external", "note": "Shared Gem — not in library"}}))
-            except Exception as e:
-                fail("GEM_INFO_FAILED", str(e))
+                    found = {"id": gem_id, "name": g.name, "description": g.description or "",
+                             "type": "system" if g.predefined else "user"}
+            except Exception:
+                found = None
+            if found is None:
+                try:
+                    for g in await _fetch_gems_rpc(sid, ts):
+                        if g["id"] == gem_id:
+                            found = g
+                            break
+                except Exception:
+                    found = None
+            if found:
+                print(json.dumps({"ok": True, "gem": found}, ensure_ascii=False))
+            else:
+                print(json.dumps({"ok": True, "gem": {"id": gem_id, "name": "",
+                    "description": "", "type": "external",
+                    "note": "Shared Gem — not in library"}}))
             return
 
         # ── Auth ──
@@ -1180,13 +1411,22 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             return
 
         if args.list_gems:
+            gems = []
             try:
                 await self.client.fetch_gems()
                 gems = [{"id": gid, "name": g.name, "description": g.description or "",
                          "type": "system" if g.predefined else "user"}
                         for gid, g in self.client.gems.items()]
-                print(json.dumps({"ok": True, "gems": gems}))
-            except Exception as e: fail("LIST_FAILED", str(e))
+            except Exception as lib_err:
+                # The lib path gates on _check_account_status(), which a stale-but-
+                # chat-valid credential fails; LIST_BOTS needs a live jar only.
+                try:
+                    gems = await _fetch_gems_rpc(sid, ts)
+                except Exception as rpc_err:
+                    fail("LIST_FAILED", "{} | browser RPC: {}".format(lib_err, rpc_err))
+            if args.limit:
+                gems = gems[:args.limit]
+            print(json.dumps({"ok": True, "gems": gems, "n": len(gems)}, ensure_ascii=False))
             return
 
         # ── Model ──
@@ -1196,13 +1436,28 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                     else resolve_model_string(self.client, args.model)
 
         # ── Gem name ──
+        # Also decides fail-fast behaviour: an id that is neither in the library nor
+        # a recognisable Gem id makes the server accept the request and then never
+        # answer, which used to burn the whole timeout with no explanation.
         gem_name = ""
+        gem_unresolved = False
         if gem_id and gem_id != "dummy":
             try:
                 await self.client.fetch_gems()
                 g = self.client.gems.get(gem_id)
                 if g: gem_name = g.name
-            except Exception: pass
+            except Exception:
+                if not gem_name:
+                    try:
+                        for _g in await _fetch_gems_rpc(sid, ts):
+                            if _g["id"] == gem_id:
+                                gem_name = _g["name"] or ""
+                                break
+                    except Exception:
+                        pass
+            if not gem_name and not re.fullmatch(r"[A-Za-z0-9_-]{5,40}", gem_id or ""):
+                fail("GEM_NOT_FOUND", f"'{gem_id}' is not a valid Gem id or URL.")
+            gem_unresolved = not gem_name
 
         if not self.raw_mode:
             model_label = friendly_model_label(model)
@@ -1253,21 +1508,36 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             actual_timeout = 600
             self.log(f"Deep research: timeout auto-extended to {actual_timeout}s")
 
+        # An id that resolves to no library Gem is either a shared Gem or a typo —
+        # for a typo the server accepts the request and simply never answers, so cap
+        # the wait instead of burning the full timeout with no explanation.
+        if gem_unresolved and not args.deep_research and actual_timeout > 60:
+            actual_timeout = 60
+            self.log("Gem id not found in your library (shared Gem?): probing with a 60s cap — raise with -t")
+
         # ── Generate with retry ──
-        max_attempts = 1 if args.no_retry else 3
+        # An unresolvable Gem id never becomes resolvable on retry, so retrying it
+        # just multiplies the wait; one capped attempt gives a fast, clear failure.
+        max_attempts = 1 if (args.no_retry or gem_unresolved) else 3
         for attempt in range(max_attempts):
             if attempt > 0: self.log(f"Retry {attempt+1}/{max_attempts}...")
             try:
                 if args.deep_research:
                     self.log("Creating research plan...")
+                    # gemini_webapi's DR entry points have no on_status hook (progress
+                    # is not reported at all while a task runs); passing it blindly
+                    # raised TypeError and silently demoted every DR run to a plain
+                    # generate_content call. Probe the signature instead.
+                    _dr_status = (lambda s: (self.log(f"  [{getattr(s, 'state', '') or '...'}]")
+                                             if not self.raw_mode and s else None))
                     try:
                         # Try high-level deep_research first (handles plan+start+wait internally)
                         self.log("Starting deep research...")
+                        _dr_kwargs = {"poll_interval": 15.0, "timeout": actual_timeout}
+                        if _supports(self.client.deep_research, "on_status"):
+                            _dr_kwargs["on_status"] = _dr_status
                         result = await asyncio.wait_for(
-                            self.client.deep_research(
-                                prompt, poll_interval=15.0, timeout=actual_timeout,
-                                on_status=lambda s: (self.log(f"  [{s.state or '...'}]")
-                                                      if not self.raw_mode and s else None)),
+                            self.client.deep_research(prompt, **_dr_kwargs),
                             timeout=actual_timeout)
                         response = result.final_output
                     except Exception as plan_err:
@@ -1287,11 +1557,11 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                                     plan, confirm_prompt="Proceed with this plan without modifications."),
                                 timeout=120)
                             self.log("Research in progress...")
+                            _wfw_kwargs = {"poll_interval": 15.0, "timeout": actual_timeout}
+                            if _supports(self.client.wait_for_deep_research, "on_status"):
+                                _wfw_kwargs["on_status"] = _dr_status
                             result = await asyncio.wait_for(
-                                self.client.wait_for_deep_research(
-                                    plan, poll_interval=15.0, timeout=actual_timeout,
-                                    on_status=lambda s: (self.log(f"  [{s.state or '...'}]")
-                                                          if not self.raw_mode and s else None)),
+                                self.client.wait_for_deep_research(plan, **_wfw_kwargs),
                                 timeout=actual_timeout)
                             response = result.final_output
                         except Exception as manual_err:
@@ -1358,7 +1628,9 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                         if pwj:
                             self.log(f"Browser fallback OK: {pwj.get('s',0)} chars")
                             print(json.dumps(pwj)); return
-                    fail("TIMEOUT", f"Timed out after {actual_timeout}s.",
+                    _hint = (" Gem id was not found in your library — the id may be wrong, or "
+                             "it is a shared Gem you cannot access.") if gem_unresolved else ""
+                    fail("TIMEOUT", f"Timed out after {actual_timeout}s.{_hint}",
                          {"timeout_s": actual_timeout, "retry": False})
                 continue
             except Exception as e:
