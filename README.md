@@ -87,8 +87,49 @@ Functions:
 | Add from Drive / Google Photos | — | web-only (CLI: local `-f` / `-i` upload only) |
 | Gems | Gem chat + `--create-gem` / `--delete-gem` / `--list-gems` | works |
 | Temporary chat | `--temporary` | works |
-| Chat history | `--list-chats` | returns `[]` on a degraded session; `--read-chat <cid>` / `--fetch-latest <cid>` work |
+| Chat history | `--list-chats` | fails `LIST_CHATS_FAILED` when Gemini Activity is off (live: ppoppo205, error 1041 "Turn on Gemini Activity to use this feature"); turn Activity on in Gemini settings and it lists; `--read-chat <cid>` / `--fetch-latest <cid>` work regardless |
 | Dictate | — | N/A for a CLI |
+
+### Fixed in 4.4 (live deep test 2026-11-14, server build 20261113)
+
+Full-function live+deep test: ~80 cases across both CLIs (every flag,
+uploads, media, Gem CRUD, multi-turn, resume, soak 5x). 29/29 offline.
+Fixes from the deep test:
+
+1. **`-g <gem> <prompt>` works** (gemini.py). Positional prompt words
+   dumped into `args.url` by `parse_intermixed_args` were never merged
+   back, so the run failed `NO_PROMPT`. Verified quoted and unquoted
+   (unquoted `Double the number 21 ...` → `42`, proving the first word
+   survives even when it matches the Gem-id pattern).
+2. **`--raw` is now truly silent** (gemini.py). The no-live-session
+   warning and the BrowserBatchRPC session notice printed directly to
+   stderr from module helpers, before any CLI object existed. Both are
+   now gated on a module-level raw flag. (gem-cli.py `--init` message
+   gated the same way.)
+3. **`--list-chats` fails honestly.** See 4.3 item 3 — the root cause is
+   Gemini Activity off (1041), not a degraded session.
+4. **gem-cli.py standalone modes work without a Gem.** `--img`,
+   `--deep-research`, `--resume` used to fail `NO_URL` / `BAD_URL`;
+   they now run direct (gem-less), and a bare prompt merges back into
+   `args.prompt` like gemini.py. `--resume <cid>` verified live.
+5. **Deep-research `on_status` crash fixed** (gem-cli.py). The ladder
+   passed `on_status` to `wait_for_deep_research`, which
+   gemini-webapi 2.1.1 does not accept — every DR run died with
+   `GEN_FAILED` after the plan was created and started. Now guarded by
+   `_supports`, like gemini.py.
+6. **Plan-creation retries.** The plan endpoint is flaky on a degraded
+   session (~3/5 attempts return empty or a refusal). Both CLIs now
+   retry plan creation up to 3 times (15s apart) instead of failing the
+   whole run on the first miss.
+
+Still blocked (server/session, not CLI): **deep research produces no
+report on this session** — the plan is created and the research runs
+(~14 min), but the final output is a stub, so the CLI fails `DR_FAILED`
+instead of reporting success. Needs a fully live session to confirm
+whether it works there. **Create video/music have no generation path**
+in gemini-webapi 2.1.1 — `--save-videos` / `--save-media` only save
+media the model returns in chat. **`-m thinking` still fails fast**
+(no `*THINKING` in the library enum).
 
 ### Fixed in 4.3 (live-verified 2026-11-14, server build 20261113)
 
@@ -106,9 +147,12 @@ Functions:
    creation returning empty, the fallback emitted a ~80-char
    plan-acknowledgement and the CLI printed `ok:true` (once with a 0-byte
    file). Both CLIs now fail `DR_FAILED` when the result is a stub.
-3. **`--list-chats` returns `[]`** on the degraded (non-live) session
-   even though chats exist — `--read-chat` by id works. Likely
-   SNlM0e-gated; needs a fully live session to confirm.
+3. **`--list-chats` no longer prints an empty list as success.** The
+   MaZiqc read-RPC was returning a server error, not an empty history:
+   `BardErrorInfo 1041, "Turn on Gemini Activity to use this feature"`
+   (Gemini Activity is off on the ppoppo205 account). The CLI now fails
+   `LIST_CHATS_FAILED` with the server's message. Turn Activity on in
+   Gemini settings and the command lists chats.
 
 ### Fixed in 4.2 (live-verified 2026-11-14, server build 20261113)
 

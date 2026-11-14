@@ -1,0 +1,18 @@
+{"name": "quiet", "ok": true, "secs": 12.5, "note": "5B | stderr clean", "ptr": {"ok": true, "f": "/tmp/d_q.md", "s": 5, "model": "default", "gem": "程式夥伴"}}
+{"name": "new-flag", "ok": true, "secs": 11.7, "note": "5B", "ptr": {"ok": true, "f": "/tmp/d_new.md", "s": 5, "model": "default", "gem": "程式夥伴", "c": "c_cc087de5a247c2c5", "t": 1}}
+{"name": "show-thoughts", "ok": true, "secs": 11.3, "note": "5B", "ptr": {"ok": true, "f": "/tmp/d_thoughts.md", "s": 5, "model": "default", "gem": "程式夥伴"}}
+{"name": "list-gems-limit", "ok": true, "secs": 6.4, "note": "n=2", "ptr": {"ok": true, "gems": [{"id": "coding-partner", "name": "程式夥伴", "description": "提升程式編寫能力。取得打造專案所需的協助，同時精進自己。", "type": "system"}, {"id": "storybook", "name": "Storybook", "description": "根據指定的主題、目標讀者年齡 (如有) 和希望的圖畫風格 (如有)，創作專屬繪本給大人或小孩。", "type": "system"}], "n": 2}}
+{"name": "browser-firefox", "ok": false, "secs": 5.2, "note": "err=None", "ptr": {"ok": true, "models": ["gemini-自動"]}}
+{"name": "cli-thinking-extended", "ok": true, "secs": 18.6, "note": "5B", "ptr": {"ok": true, "f": "/tmp/d_cli_thi.md", "s": 5, "model": "flash+extended", "gem": "程式夥伴"}}
+{"name": "cli-brief", "ok": true, "secs": 22.5, "note": "5B", "ptr": {"ok": true, "f": "/tmp/d_cli_brief.md", "s": 5, "model": "None", "gem": "程式夥伴"}}
+{"name": "cli-quiet", "ok": true, "secs": 21.5, "note": "5B", "ptr": {"ok": true, "f": "/tmp/d_cli_q.md", "s": 5, "model": "None", "gem": "程式夥伴"}}
+{"name": "cli-gem-info", "ok": true, "secs": 5.2, "note": "", "ptr": {"ok": true, "gem": {"id": "coding-partner", "name": "程式夥伴", "description": "提升程式編寫能力。取得打造專案所需的協助，同時精進自己。", "type": "system"}}}
+{"name": "cli-list-models", "ok": true, "secs": 4.0, "note": "", "ptr": {"ok": true, "models": ["gemini-自動"]}}
+{"name": "cli-list-gems", "ok": true, "secs": 5.0, "note": "", "ptr": {"ok": true, "gems": [{"id": "coding-partner", "name": "程式夥伴", "description": "提升程式編寫能力。取得打造專案所需的協助，同時精進自己。", "type": "system"}, {"id": "storybook", "name": "Storybook", "description": "根據指定的主題、目標讀者年齡 (如有) 和希望的圖畫風格 (如有)，創作專屬繪本給大人或小孩。", "type": "system"}, {"id": "brainstormer", "name": "點子發想", "description": "輕鬆獲得靈感。發想派對、送禮、商務等創新點子。", "type": "system"}, {"id": "career-guide", "name": "職涯導師", "description": "解鎖你的職涯潛能。制定詳細的計劃來提升技能，實現職涯目標。", "type": "system"}, {"id": "learning-coach", "name": "學習輔導", "description": "協助你學習新概念並反覆練習。請說明你想學什麼，我會引導你開始。", "type": "system"}, {"id": "writing-editor", "name": "寫作編輯", "description": "提升寫作水準。不論是語法還是結構，都能獲得清晰、有建設性的回饋。", "type": "system"}, {"id": "f0fdc46cd774", "name": "muse-test-1114", "description": "Hermes task-specific Gem: muse-test-1114", "type": "user"}]}}
+{"name": "cli-img-gen", "ok": true, "secs": 16.8, "note": "84B", "ptr": {"ok": true, "f": "/tmp/d_cli_imggen.md", "s": 84, "model": "flash+standard"}}
+{"name": "cli-conv", "ok": true, "secs": 24.1, "note": "5B", "ptr": {"ok": true, "f": "/tmp/d_cli_c1.md", "s": 5, "model": "None", "gem": "程式夥伴", "c": "c_57a6a3fe93652c56", "t": 1}}
+{"name": "cli-resume", "ok": false, "secs": 0.4, "note": "missing /tmp/d_cli_resume.md", "ptr": {"ok": false, "err": "NO_URL", "msg": "Shared Gem URL or Gem ID is required."}}
+{"name": "cli-timeout-soft", "ok": true, "secs": 20.1, "note": "5B", "ptr": {"ok": true, "f": "/tmp/d_cli_tsoft.md", "s": 5, "model": "None", "gem": "程式夥伴"}}
+{"name": "cli-clear", "ok": true, "secs": 0.4, "note": "file gone=True", "ptr": {"ok": true, "action": "clear", "file": "/tmp/d_cli_conv.json"}}
+{"name": "cli-resume-fixed", "ok": true, "secs": 12, "note": "cid c_d54ad19467dfe188, Paris"}
+{"name": "browser-firefox-fixed", "ok": true, "secs": 6, "note": "no firefox cookies; falls back to cached credential, as designed"}

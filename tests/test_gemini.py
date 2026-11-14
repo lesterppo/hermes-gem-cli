@@ -278,6 +278,37 @@ class TestDrStub(unittest.TestCase):
         self.assertFalse(g._dr_is_stub("## Report\n\n" + "detail. " * 100))
 
 
+class TestSupports(unittest.TestCase):
+    """Library signatures drift across gemini-webapi versions; callers must
+    probe before passing optional kwargs (live 2026-11-14: gem-cli.py
+    passed on_status to wait_for_deep_research, which 2.1.1 rejects)."""
+
+    def test_supports(self):
+        def f(a, b=1):
+            pass
+        self.assertTrue(g._supports(f, "a"))
+        self.assertTrue(g._supports(f, "b"))
+        self.assertFalse(g._supports(f, "on_status"))
+        self.assertFalse(g._supports(None, "x"))
+
+
+class TestRpcErrorMessage(unittest.TestCase):
+    """A read-RPC that returns no payloads is a failed read, not 'no data':
+    the server answers with a BardErrorInfo envelope (live 2026-11-14:
+    MaZiqc 1041, Gemini Activity off)."""
+
+    def test_activity_off_envelope(self):
+        raw = ('[["wrb.fr","MaZiqc",null,null,null,[9,null,'
+               '[["type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",'
+               '[1041,null,"Turn on Gemini Activity to use this feature. (1041)"]]]],'
+               '"generic"]]')
+        self.assertEqual(g._rpc_error_message(raw),
+                         "Turn on Gemini Activity to use this feature. (1041) (1041)")
+
+    def test_no_error(self):
+        self.assertIsNone(g._rpc_error_message(")]}'\n\n[[\"wrb.fr\",\"MaZiqc\",\"ok\"]]"))
+
+
 class TestImportSafety(unittest.TestCase):
     def test_import_without_optional_deps_does_not_exit(self):
         """The CLI exits(1) with DEP_MISSING when run without gemini-webapi, but

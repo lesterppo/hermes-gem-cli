@@ -141,6 +141,37 @@ gem-cli "<url>" -m pro --deep-research "research question"
 # → timeout auto-extends to 600s
 ```
 
+Live status 2026-11-14 (ppoppo205, degraded session): plan creation is
+flaky — sometimes it returns empty, sometimes the model refuses the plan
+in Chinese. gem-cli.py's manual plan path got a plan twice with `-m pro`
+("Gemini 4 Hydrogen Overview") and reached the wait stage; the research
+itself takes longer than the 600s auto-extended timeout, so use
+`-t 1500` for a full run. gemini-webapi 2.1.1's `wait_for_deep_research`
+has no `on_status` — guard with `_supports` before passing it (fixed in
+gem-cli.py; gemini.py already guards). When plan creation fails and the
+fallback returns only a stub (<200 chars), both CLIs fail `DR_FAILED`
+instead of reporting `ok:true`. `--deep-research` without a Gem runs
+direct (gem-less) since the 4.4 fix.
+
+## Live server behaviours (verified 2026-11-14)
+
+- `--list-chats` fails `LIST_CHATS_FAILED` when Gemini Activity is off:
+  the MaZiqc read-RPC answers `BardErrorInfo 1041, "Turn on Gemini
+  Activity to use this feature"`. Turn Activity on in Gemini settings.
+- `--delete-chat` removes the conversation from history; the object
+  stays readable by `--read-chat <cid>`. That is server behaviour, not
+  a failed delete.
+- `-g <gem> <prompt>` works in gemini.py (positional prompt used to fall
+  through to `NO_PROMPT`).
+- `--raw` / `-q` now produce zero stderr (module-level warning prints
+  are suppressed in raw mode).
+- `--img` / `--deep-research` without a Gem work in gem-cli.py (used to
+  fail `NO_URL` / `BAD_URL`); a bare prompt without a Gem runs direct.
+- Video/music: no generation path exists in gemini-webapi 2.1.1 — the
+  web's Create video/music modes are not exposed. `--save-videos` /
+  `--save-media` only save media the model returns in chat (it does not,
+  from a plain prompt).
+
 ## Pitfalls
 
 - Deep research requires Pro model (Flash may hang at plan creation)

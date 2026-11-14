@@ -521,6 +521,10 @@ def _browser_login(preferred: str | None = None) -> tuple:
 # request per session at most.
 _PROBE_CACHE: dict = {}
 _WARNED_NO_LIVE = [False]
+# --raw/--quiet: module-level stderr suppression for helpers that run
+# before any CLI object exists (resolve_auth, BrowserBatchRPC). Set from
+# args in run(); log() checks self.raw_mode separately.
+_RAW_STDERR = [False]
 
 
 def _probe_live(sid: str, ts: str | None) -> bool:
@@ -609,8 +613,9 @@ def resolve_auth(preferred_browser: str | None = None, allow_login: bool = False
 
     if not _WARNED_NO_LIVE[0]:
         _WARNED_NO_LIVE[0] = True
-        print("[gemini] warning: no live-session credential found — using the first "
-              "available pair (chat may work; Gem/read APIs will fail)", file=sys.stderr)
+        if not _RAW_STDERR[0]:
+            print("[gemini] warning: no live-session credential found — using the first "
+                  "available pair (chat may work; Gem/read APIs will fail)", file=sys.stderr)
     src, c_sid, c_ts = cands[0]
     _LAST_AUTH_SRC = src
     return c_sid, c_ts
@@ -648,8 +653,9 @@ class BrowserBatchRPC:
             use = jar
         elif jar:
             use = jar                      # browser session outranks a lone pair
-            print(f"[gemini] browser-shaped RPC: using {src} session "
-                  f"(requested credential had no full jar)", file=sys.stderr)
+            if not _RAW_STDERR[0]:
+                print(f"[gemini] browser-shaped RPC: using {src} session "
+                      f"(requested credential had no full jar)", file=sys.stderr)
         else:
             use = {}
         for k, v in use.items():
@@ -712,6 +718,24 @@ def _extract_rpc_payloads(rpc_text: str, rpcid: str) -> list:
             except (json.JSONDecodeError, TypeError): continue
     except Exception: pass
     return out
+
+
+def _rpc_error_message(rpc_text: str) -> str | None:
+    """Pull the server's error message out of a batchexecute error envelope.
+
+    A read-RPC that the server refuses (e.g. MaZiqc with Gemini Activity
+    off) answers with a BardErrorInfo envelope instead of payloads:
+    [...,["type.googleapis.com/...BardErrorInfo",[1041,null,
+    "Turn on Gemini Activity to use this feature. (1041)"]],...].
+    An empty payload list is a failed read, not "no data" — surface it.
+    """
+    m = re.search(r'BardErrorInfo.*?\[(\d+),null,"([^"]+)"', rpc_text)
+    if m:
+        return f"{m.group(2)} ({m.group(1)})"
+    return None
+
+
+# ── Cookie helpers ───────────────────────────────────────────────
 
 
 async def _fetch_gems_rpc(sid: str, ts: str | None, language: str = "en") -> list:
@@ -955,6 +979,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         
         args = p.parse_intermixed_args()
         self.raw_mode = args.raw_mode or args.quiet
+        _RAW_STDERR[0] = self.raw_mode
         
         if self.raw_mode:
             _loguru.logger.remove()
@@ -1260,6 +1285,15 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 try:
                     text = await rpc.rpc("MaZiqc", [args.limit, None, [0, None, 1]])
                     payloads = _extract_rpc_payloads(text, "MaZiqc")
+                    if not payloads:
+                        # Empty payloads = failed read, not "no chats": the
+                        # server answers with a BardErrorInfo envelope
+                        # (live-verified 2026-11-14: 1041, Gemini Activity
+                        # off on this account). Report it, don't print ok.
+                        msg = _rpc_error_message(text)
+                        fail("LIST_CHATS_FAILED",
+                             msg or "List-chats RPC returned no data.",
+                             {"retry": False})
                     chats = []
                     for pb in payloads:
                         # shape: [null, "<pageToken>", [[cid, title, ...], ...]] — chats at pb[2]
@@ -1411,6 +1445,17 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         # (parse_intermixed_args dumps all positionals into args.url first.)
         if not args.gem_id and args.url and args.prompt:
             pass  # url + separate prompt words — keep as-is
+        elif args.gem_id and args.url and not args.prompt_flag:
+            # -g given: the Gem is already chosen, so positionals dumped
+            # into args.url are prompt text — merge them, unless the url is
+            # a lone URL/id-like token with nothing after it (a stray Gem
+            # arg, dropped). Without the args.prompt check, an unquoted
+            # multi-word prompt lost its first word when it happened to
+            # match the id pattern (e.g. "Reply").
+            if args.prompt or not (args.url.startswith(("http://", "https://"))
+                                   or re.fullmatch(r"[A-Za-z0-9_-]{5,20}", args.url or "")):
+                args.prompt = args.url.split() + list(args.prompt)
+            args.url = None
         elif not args.gem_id and args.url and not args.prompt_flag \
                 and not (args.url.startswith(("http://", "https://"))
                          or re.fullmatch(r"[A-Za-z0-9_-]{5,20}", args.url or "")):
@@ -1658,8 +1703,24 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                         # Fallback: manual plan-based flow
                         self.log(f"High-level DR failed, trying manual plan: {plan_msg}")
                         try:
-                            plan = await asyncio.wait_for(
-                                self.client.create_deep_research_plan(prompt, model=model), timeout=120)
+                            # Plan creation is flaky on a degraded session
+                            # (live 2026-11-14: empty/refusal ~3/5 attempts,
+                            # success the other times) — retry it, not the
+                            # whole ladder.
+                            plan = None
+                            last_plan_err = None
+                            for pi in range(3):
+                                try:
+                                    plan = await asyncio.wait_for(
+                                        self.client.create_deep_research_plan(prompt, model=model), timeout=120)
+                                    break
+                                except Exception as pe:
+                                    last_plan_err = pe
+                                    self.log(f"Plan attempt {pi + 1}/3 failed: {pe}")
+                                    if pi < 2:
+                                        await asyncio.sleep(15)
+                            if plan is None:
+                                raise last_plan_err
                             self.log(f"Plan: {plan.title or 'Research'} — starting...")
                             await asyncio.wait_for(
                                 self.client.start_deep_research(

@@ -128,6 +128,19 @@ def friendly_model_label(model) -> str:
     return str(model)
 
 
+def _supports(fn, param: str) -> bool:
+    """True when a library callable accepts `param` (lib versions drift).
+
+    gemini-webapi 2.1.1's wait_for_deep_research has no on_status — passing
+    it raises TypeError and kills the whole DR run (live 2026-11-14).
+    """
+    try:
+        import inspect
+        return param in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _read_stdin_if_piped(timeout: float = 2.0) -> str:
     """Read piped stdin without hanging forever on an open pipe.
 
@@ -624,7 +637,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
 
         # ── Handle --init ──
         if args.init:
-            if not args.quiet:
+            if not self.raw_mode:
                 print("[gem-cli] Extracting auth tokens from browser...", file=sys.stderr)
             sid = os.getenv("GEMINI_SID")
             ts = os.getenv("GEMINI_TS")
@@ -708,7 +721,20 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             return
 
         # ── Require URL for non-auth commands ──
-        if not args.url:
+        # parse_intermixed_args dumps all positionals into args.url first:
+        # a sentence-like positional is prompt text, not a Gem URL. Merge
+        # it back into args.prompt (same rule as gemini.py) so a bare
+        # prompt without a Gem runs direct instead of BAD_URL.
+        if args.url and not args.prompt_flag \
+                and not (args.url.startswith(("http://", "https://"))
+                         or re.fullmatch(r"[A-Za-z0-9_-]{5,20}", args.url or "")):
+            args.prompt = args.url.split() + list(args.prompt)
+            args.url = None
+        # --img / --img-gen / --deep-research / --resume are standalone
+        # modes: they run direct (gem-less) when no Gem is given, the same
+        # way gemini.py runs them. (Before this, `--resume <cid>` without
+        # a Gem failed NO_URL even though resume needs no Gem.)
+        if not args.url and not (args.image_prompt or args.image_gen or args.deep_research or args.resume_session):
             parser.print_help()
             fail("NO_URL", "Shared Gem URL or Gem ID is required.")
 
@@ -745,6 +771,8 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         # ── Extract Gem ID ──
         if args.list_models or args.list_gems:
             gem_id = "dummy"
+        elif not args.url:
+            gem_id = None  # direct (gem-less) run: --img / --deep-research
         else:
             try:
                 gem_id = extract_gem_id(args.url)
@@ -834,7 +862,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
 
         if not self.raw_mode:
             model_label = friendly_model_label(model)
-            parts = [f"gem={gem_name or gem_id}", f"model={model_label}"]
+            parts = [f"gem={gem_name or gem_id or 'direct'}", f"model={model_label}"]
             if args.deep_research:
                 parts.append("deep-research")
             if args.image_gen:
@@ -912,11 +940,27 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             try:
                 if args.deep_research:
                     # Deep research: create plan → start → wait for results
-                    if not self.raw_mode:
-                        self.log("Creating research plan...")
-                    plan = await asyncio.wait_for(
-                        self.client.create_deep_research_plan(prompt, model=model),
-                        timeout=120)
+                    # Plan creation is flaky on a degraded session (live
+                    # 2026-11-14: empty/refusal ~3/5 attempts, success the
+                    # other times) — retry the plan call, not the ladder.
+                    plan = None
+                    last_plan_err = None
+                    for pi in range(3):
+                        try:
+                            if not self.raw_mode:
+                                self.log("Creating research plan...")
+                            plan = await asyncio.wait_for(
+                                self.client.create_deep_research_plan(prompt, model=model),
+                                timeout=120)
+                            break
+                        except Exception as pe:
+                            last_plan_err = pe
+                            if not self.raw_mode:
+                                self.log(f"Plan attempt {pi + 1}/3 failed: {pe}")
+                            if pi < 2:
+                                await asyncio.sleep(15)
+                    if plan is None:
+                        raise last_plan_err
                     if not self.raw_mode:
                         self.log(f"Plan: {plan.title or 'Research plan'} — starting...")
                     await asyncio.wait_for(
@@ -927,16 +971,14 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                         timeout=120)
                     if not self.raw_mode:
                         self.log("Research in progress...")
+                    _wfw = {"poll_interval": 15.0, "timeout": actual_timeout}
+                    if _supports(self.client.wait_for_deep_research, "on_status"):
+                        _wfw["on_status"] = lambda s: (
+                            self.log(f"  [{s.state or '...'}]")
+                            if not self.raw_mode and s else None
+                        )
                     result = await asyncio.wait_for(
-                        self.client.wait_for_deep_research(
-                            plan,
-                            poll_interval=15.0,
-                            timeout=actual_timeout,
-                            on_status=lambda s: (
-                                self.log(f"  [{s.state or '...'}]") 
-                                if not self.raw_mode and s else None
-                            ),
-                        ),
+                        self.client.wait_for_deep_research(plan, **_wfw),
                         timeout=actual_timeout,
                     )
                     response = result.final_output
