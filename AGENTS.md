@@ -78,6 +78,8 @@ Auth is resolved in this priority order:
 | `--show-thoughts` | Include thinking traces (`thoughts` field, `## Thoughts` in md) |
 | `--save-videos DIR` | Save Veo videos (`GeneratedVideo`, 3/day Pro), pointer `vids` |
 | `--save-media DIR` | Save audio/video media, pointer `media` |
+| `--video PROMPT` / `--music PROMPT` | Generate video (Veo) / music (Lyria) via the media tool flag; prime → media turn → poll, pointer has `kind`, `cid`, `download_url`, `files` |
+| `--aspect landscape\|portrait` | Video aspect ratio (default landscape) |
 | `--fetch-latest CID` | Fetch latest turn for chat (faster than `read-chat`) |
 | `--deep-research-status ID` | Poll research status by ID |
 | `--extract-canvas FILE` | Save Canvas/HTML artifact (html/svg/canvas block) |
@@ -167,10 +169,22 @@ direct (gem-less) since the 4.4 fix.
   are suppressed in raw mode).
 - `--img` / `--deep-research` without a Gem work in gem-cli.py (used to
   fail `NO_URL` / `BAD_URL`); a bare prompt without a Gem runs direct.
-- Video/music: no generation path exists in gemini-webapi 2.1.1 — the
-  web's Create video/music modes are not exposed. `--save-videos` /
-  `--save-media` only save media the model returns in chat (it does not,
-  from a plain prompt).
+- Video/music: generation path added in 4.5 (`--video PROMPT` / `--music PROMPT`,
+  both CLIs). The web's Create video/music modes are not exposed by
+  gemini-webapi 2.1.1, so the CLI injects the media tool flag into the
+  StreamGenerate payload (prime turn → media turn → poll `read_chat` for
+  the finished file). Mechanism reverse-engineered from live web traffic;
+  see the comment block above `_generate_media` in gemini.py. `--save-videos` /
+  `--save-media` choose the download dir. Live 2026-11-14 on ppoppo205:
+  **music GREEN** — real track in 66s (MP3 1.5 MB + MP4 4.3 MB + cover,
+  `c_639f5a0bbff02910`, `ready_to_fly.mp4`), and again via gem-cli.py
+  (`c_5dd338ecc4c4587b`, `we_are_alive_tonight.mp4`); **video pipeline
+  verified but subscription-gated** — server verdict `MEDIA_QUOTA` in
+  ~31s ("upgrade your subscription"), no clip producible on the free
+  account; gem-cli.py's video leg stalled twice (fragment "_923") and
+  is not verified. Poll reads only the newest model turn's text (a prime
+  turn's "READY" leaked into the verdict before this fix); a failed
+  media run now prints the conversation id for re-reading.
 
 ## Pitfalls
 

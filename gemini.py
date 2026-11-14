@@ -11,7 +11,7 @@ Output: {"ok":true,"f":"./out.md","s":1234,"b":2,"imgs":3,
 
 Repo: lesterppo/hermes-gem-cli (primary), lesterppo/gemini-web-cli (historical)
 """
-import asyncio, argparse, json, os, re, subprocess, sys, time, webbrowser
+import asyncio, argparse, contextvars, json, os, re, subprocess, sys, time, webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -783,6 +783,173 @@ def looks_like_image_gen(prompt: str) -> bool:
         if p.startswith(kw): return True
     return sum(1 for kw in _IMG_GEN_KW if kw in p) >= 2
 
+# ── Video / music generation ─────────────────────────────────────
+# The web app's Create video / Create music tools are not exposed by
+# gemini-webapi 2.1.1, but the underlying StreamGenerate request is the
+# same one the library sends — with a "generate media" tool flag in
+# message_content[9] and media selectors in the inner payload.
+# Reverse-engineered from live gemini.google.com traffic; see
+# FarisHijazi/gemini-web-api docs/devlog/claude_2026-07-08-0045-veo-video-cracked.md
+# (Veo video verified end-to-end there on gemini-webapi 2.1.x).
+#
+# Mechanism, in brief:
+#   * A media request as the FIRST turn of a fresh conversation is
+#     rejected by the server (error 1053), so the pipeline primes the
+#     conversation with a cheap text turn first, then sends the media
+#     prompt on the second turn.
+#   * message_content[9] = the media tool flag: trailing 1 = video,
+#     trailing 2 = portrait video. inner[17] = [[1]] selects video
+#     (the library hardcodes [[0]], i.e. image). For video,
+#     inner[54] = [] and inner[55] = [[aspect]] (16 landscape,
+#     17 portrait). Never set inner[49] — it is a per-conversation
+#     turn counter; setting it also yields error 1053.
+#   * The video turn uses the gemini-3-video model header. Music uses
+#     the default model — Google's docs say a full track wants Pro,
+#     but the server routes by prompt + tool flag, and the plain-prompt
+#     probe reached the music tool on the default model.
+#   * The send returns fast with a pending chip; the finished media
+#     appears on the turn afterwards, so we poll read_chat until
+#     turn.model_output.videos / .media is populated.
+#   * Injection: gemini_webapi.client does `import orjson as json` and
+#     serialises the generate payload with json.dumps. We wrap that
+#     module reference in a transparent proxy, gated by a contextvar
+#     that is set only for the media turn — every other serialisation
+#     passes straight through, and the proxy is installed lazily so a
+#     plain chat never touches it.
+
+_MEDIA_TOOL = [None, None, None, None, None, None, [[None, None, None, 1]]]
+_MEDIA_TOOL_PORTRAIT = [None, None, None, None, None, None, [[None, None, None, 2]]]
+_VIDEO_MODEL = {
+    "model_name": "gemini-3-video",
+    "model_header": {"x-goog-ext-525001261-jspb":
+        '[1,null,null,null,"e6fa609c3fa255c0",null,null,0,[4,5,6,8],null,null,2,null,null,3,null,"00000000-0000-0000-0000-000000000000"]'},
+}
+_ASPECT_LANDSCAPE = 16
+_ASPECT_PORTRAIT = 17
+
+_media_ctx = contextvars.ContextVar("gemini_media_mode", default=None)   # "video" | "music" | None
+_media_aspect = contextvars.ContextVar("gemini_media_aspect", default=_ASPECT_LANDSCAPE)
+
+def _is_generate_payload(obj) -> bool:
+    """True for the library's StreamGenerate inner payload: a list at
+    least 69 wide whose first element is itself a list (message_content)."""
+    return isinstance(obj, list) and len(obj) >= 69 and isinstance(obj[0], list)
+
+class _MediaJsonProxy:
+    """Transparent proxy over the `json` (orjson) reference inside
+    gemini_webapi.client. Only rewrites the generate payload shape,
+    only while the media contextvar is set."""
+    def __init__(self, real): self._real = real
+    def __getattr__(self, name): return getattr(self._real, name)
+    def dumps(self, obj, *args, **kwargs):
+        mode = _media_ctx.get()
+        if mode and _is_generate_payload(obj):
+            mc = obj[0]
+            while len(mc) < 10: mc.append(None)
+            mc[9] = _MEDIA_TOOL_PORTRAIT if _media_aspect.get() == _ASPECT_PORTRAIT else _MEDIA_TOOL
+            obj[17] = [[1]]
+            if mode == "video":
+                obj[54] = []
+                obj[55] = [[_media_aspect.get()]]
+        return self._real.dumps(obj, *args, **kwargs)
+
+def _install_media_proxy():
+    import gemini_webapi.client as _gclient
+    if not isinstance(_gclient.json, _MediaJsonProxy):
+        _gclient.json = _MediaJsonProxy(_gclient.json)
+
+def _looks_like_quota(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in ("limit", "quota", "upgrade", "subscription",
+                                "usage", "reset", "plan"))
+
+class MediaStopped(RuntimeError):
+    """Gemini ended the media turn with a verdict (quota / subscription /
+    filter) instead of media. The message is the server's own text.
+    Carries the conversation id so a stalled turn can be inspected
+    afterwards with --read-chat (live 2026-11-14: a video turn stalled
+    with only a "_923" fragment and no cid was printed, so the turn
+    could not be re-read)."""
+    def __init__(self, msg, cid=None):
+        super().__init__(msg)
+        self.cid = cid
+
+async def _poll_media(client, cid, kind, timeout, interval=8.0):
+    """Poll read_chat until the finished media appears on a model turn.
+    Returns (media_obj, text). media_obj is a GeneratedVideo /
+    GeneratedMedia or None; text is the latest model text — the server's
+    verdict when the turn ends without media. Stops early when the same
+    quota/subscription verdict repeats twice in a row (the turn is final)."""
+    deadline = time.monotonic() + timeout
+    last_text = ""
+    stop_repeats = 0
+    while time.monotonic() < deadline:
+        try:
+            hist = await client.read_chat(cid, limit=2)
+        except Exception:
+            hist = None
+        if hist:
+            turns = [t for t in (hist.turns or [])
+                     if t.role == "model" and t.model_output]
+            for turn in turns:
+                items = (turn.model_output.videos if kind == "video"
+                         else turn.model_output.media)
+                if items:
+                    return items[0], turn.text or ""
+            # Verdict text comes only from the NEWEST model turn (turns
+            # are newest-first); an older turn's text — e.g. the prime
+            # turn's "READY" — is not the media turn's verdict.
+            newest_text = turns[0].text if turns else ""
+            if newest_text:
+                if newest_text == last_text and _looks_like_quota(newest_text):
+                    stop_repeats += 1
+                    if stop_repeats >= 2:
+                        return None, newest_text
+                else:
+                    stop_repeats = 0
+                last_text = newest_text
+            else:
+                stop_repeats = 0
+        await asyncio.sleep(interval)
+    return None, last_text
+
+async def _generate_media(client, prompt, kind, aspect=_ASPECT_LANDSCAPE, timeout=600.0):
+    """Full media pipeline. Returns (media_obj, cid, text).
+    1. Prime the conversation with a cheap text turn (a media request
+       as the first turn is rejected, error 1053).
+    2. Send the prompt with the media tool flag injected (contextvar).
+    3. Poll read_chat until the finished media appears.
+    Raises MediaStopped when the server ends the turn with a verdict
+    instead of media; RuntimeError when no conversation could be opened.
+    """
+    _install_media_proxy()
+    chat = client.start_chat()
+    await asyncio.wait_for(
+        chat.send_message("I want to create media. Reply with just: READY"),
+        timeout=120)
+    cid = chat.cid
+    if not cid:
+        raise RuntimeError("failed to open a conversation for media generation")
+    # Video needs the video model header; music uses the default model.
+    if kind == "video":
+        chat.model = _VIDEO_MODEL
+    tok = _media_ctx.set(kind)
+    atok = _media_aspect.set(aspect)
+    try:
+        try:
+            await asyncio.wait_for(chat.send_message(prompt), timeout=180)
+        except asyncio.TimeoutError:
+            # The send may still be running server-side; the media can
+            # still land on the turn — poll the conversation either way.
+            pass
+    finally:
+        _media_ctx.reset(tok)
+        _media_aspect.reset(atok)
+    media, text = await _poll_media(client, cid, kind, timeout=timeout)
+    if media is None:
+        raise MediaStopped(text or "Gemini ended the turn without media.", cid=cid)
+    return media, cid, text
+
 # ── Conversation state ───────────────────────────────────────
 
 class ChatRef:
@@ -876,6 +1043,9 @@ class GeminiCLI:
   gemini AbCdEf1234 -f report.pdf -m pro "analyze"    # file upload
   gemini AbCdEf1234 -i chart.png "explain trend"      # image upload
   gemini AbCdEf1234 --img "a cat flying"              # image generation
+  gemini --video "a puppy in a sunny field"            # video generation (Veo)
+  gemini --music "upbeat electronic track"             # music generation (Lyria)
+  gemini --video "city at dusk" --aspect portrait      # portrait video
   gemini AbCdEf1234 --deep-research "topic"           # deep research
   gemini --init                                        # cache auth
   gemini --login                                       # browser login
@@ -913,6 +1083,11 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         # Image gen
         p.add_argument("--img-gen", action="store_true", dest="image_gen", help="Force image gen")
         p.add_argument("--img", dest="image_prompt", metavar="PROMPT", help="Generate image")
+        # Video / music gen (Veo / Lyria via the web media tool flag)
+        p.add_argument("--video", dest="video_prompt", metavar="PROMPT", help="Generate video (Veo)")
+        p.add_argument("--music", dest="music_prompt", metavar="PROMPT", help="Generate music (Lyria)")
+        p.add_argument("--aspect", choices=["landscape", "portrait"], default="landscape",
+                       help="Video aspect ratio (default landscape)")
         # Deep research
         p.add_argument("--deep-research", action="store_true", dest="deep_research",
                        help="Deep research mode (~1-10 min)")
@@ -1474,7 +1649,12 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             gem_id = None  # direct chat, no Gem required
 
         # ── Build prompt ──
-        if args.image_prompt:
+        media_kind = None
+        if args.video_prompt:
+            prompt = args.video_prompt; media_kind = "video"
+        elif args.music_prompt:
+            prompt = args.music_prompt; media_kind = "music"
+        elif args.image_prompt:
             prompt = f"Generate an image: {args.image_prompt}"
             args.image_gen = True
         elif args.prompt_flag:
@@ -1608,6 +1788,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             parts.append(f"model={model_label}")
             if args.deep_research: parts.append("deep-research")
             if args.image_gen: parts.append("img-gen")
+            if media_kind: parts.append(media_kind)
             if args.conversation: parts.append("multi-turn")
             self.log(", ".join(parts))
 
@@ -1653,6 +1834,13 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         if args.deep_research and args.timeout == 120:
             actual_timeout = 600
             self.log(f"Deep research: timeout auto-extended to {actual_timeout}s")
+        # Video renders take minutes; music a couple of minutes.
+        if media_kind == "video" and args.timeout == 120:
+            actual_timeout = 600
+            self.log(f"Video generation: timeout auto-extended to {actual_timeout}s")
+        elif media_kind == "music" and args.timeout == 120:
+            actual_timeout = 300
+            self.log(f"Music generation: timeout auto-extended to {actual_timeout}s")
 
         # An id that resolves to no library Gem is either a shared Gem or a typo —
         # for a typo the server accepts the request and simply never answers, so cap
@@ -1661,12 +1849,84 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         # never answers should fail fast with a clear message, not burn the
         # full timeout across retries.
         direct_chat = not gem_id
-        if (gem_unresolved or direct_chat) and not args.deep_research and actual_timeout > 60:
+        if (gem_unresolved or direct_chat) and not args.deep_research and not media_kind and actual_timeout > 60:
             actual_timeout = 60
             if gem_unresolved:
                 self.log("Gem id not found in your library (shared Gem?): probing with a 60s cap — raise with -t")
             else:
                 self.log("Direct chat (no Gem): probing with a 60s cap — raise with -t")
+
+        # ── Video / music generation ──
+        # Own pipeline (prime → media turn → poll), not the generic
+        # generate loop: the media turn returns fast with a pending chip
+        # and the finished file only lands on the conversation afterwards.
+        if media_kind:
+            self.log(f"Generating {media_kind}...")
+            try:
+                media_obj, media_cid, media_text = await _generate_media(
+                    self.client, prompt, media_kind,
+                    aspect=_ASPECT_PORTRAIT if args.aspect == "portrait" else _ASPECT_LANDSCAPE,
+                    timeout=actual_timeout)
+            except MediaStopped as ms:
+                _extra = {"retry": False}
+                if getattr(ms, "cid", None): _extra["cid"] = ms.cid
+                fail("MEDIA_QUOTA" if _looks_like_quota(str(ms)) else "MEDIA_FAILED",
+                     str(ms), _extra)
+            except asyncio.TimeoutError:
+                fail("TIMEOUT", f"Media generation timed out after {actual_timeout}s.",
+                     {"timeout_s": actual_timeout, "retry": False})
+            except Exception as e:
+                fail("MEDIA_FAILED", f"{type(e).__name__}: {e}", {"retry": False})
+            url = getattr(media_obj, "url", None)
+            # Save: library first (handles 206 polling), urllib + SID/TS
+            # cookies as fallback, else report the download URL.
+            save_dir = Path(args.save_videos if media_kind == "video" and args.save_videos else
+                            args.save_media if media_kind == "music" and args.save_media else
+                            ("./videos" if media_kind == "video" else "./music"))
+            save_dir.mkdir(parents=True, exist_ok=True)
+            saved = []
+            try:
+                res = await media_obj.save(path=str(save_dir))
+                if isinstance(res, dict):
+                    saved = [v for v in res.values() if v and Path(v).exists()]
+                elif isinstance(res, str) and Path(res).exists():
+                    saved = [res]
+            except Exception as save_err:
+                self.log(f"Library save failed ({save_err}); trying direct download")
+            if not saved and url:
+                import urllib.request as _ur
+                cookie_str = f"__Secure-1PSID={sid}; __Secure-1PSIDTS={ts}"
+                try:
+                    fp = save_dir / f"gemini_{media_kind}_{datetime.now().strftime('%Y%m%d-%H%M%S')}.mp4"
+                    req = _ur.Request(url, headers={"Cookie": cookie_str})
+                    with _ur.urlopen(req, timeout=120) as resp:
+                        fp.write_bytes(resp.read())
+                    saved = [str(fp)]
+                except Exception as dl_err:
+                    self.log(f"Direct download failed: {dl_err}")
+            # Summary file + pointer (same contract as the text path).
+            ext = ".json" if args.json_out else ".md"
+            out_path = Path(args.output) if args.output else \
+                       Path(f"/tmp/gemini-{datetime.now().strftime('%Y%m%d-%H%M%S')}{ext}")
+            if args.json_out:
+                payload = {"ok": True, "kind": media_kind, "cid": media_cid,
+                           "prompt": prompt, "download_url": url, "files": saved,
+                           "model_text": media_text or ""}
+                out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            else:
+                lines = [f"# {media_kind.title()} generation", "", f"Prompt: {prompt}", "",
+                         f"Conversation: {media_cid}", f"Download URL: {url or '(none)'}", ""]
+                if saved:
+                    lines.append("Saved files:")
+                    lines += [f"- {f}" for f in saved]
+                if media_text:
+                    lines += ["", "Model text:", "", media_text]
+                out_path.write_text("\n".join(lines), encoding="utf-8")
+            ptr = {"ok": True, "kind": media_kind, "f": self._short(out_path),
+                   "s": out_path.stat().st_size, "cid": media_cid,
+                   "download_url": url, "files": saved}
+            print(json.dumps(ptr))
+            return
 
         # ── Generate with retry ──
         # An unresolvable Gem id never becomes resolvable on retry, so retrying it

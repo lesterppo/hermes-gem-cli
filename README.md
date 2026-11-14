@@ -53,7 +53,8 @@ requests (~4s chat). This is 3-10x faster than browser automation.
 | Extended thinking | `--thinking extended` | adds ~30-60s |
 | Temporary chat | `--temporary` | ephemeral, not in history |
 | Thinking traces | `--show-thoughts` | adds thoughts to output |
-| Video generation | `--save-videos DIR` | Veo 3, 3/day Pro |
+| Video generation | `--video PROMPT [--aspect portrait]` | Veo 3, primes a chat then polls for the finished clip; saves to `--save-videos DIR` |
+| Music generation | `--music PROMPT` | Lyria, same prime + poll pipeline; saves MP3+MP4 to `--save-media DIR` |
 | Canvas artifact | `--extract-canvas FILE` | saves html block |
 | Fetch latest | `--fetch-latest c_xxx` | fast latest turn |
 | Deep research status | `--deep-research-status c_xxx` | is the report in the chat yet? |
@@ -77,7 +78,7 @@ Functions:
 | Web function | CLI | Status |
 |--------------|-----|--------|
 | Create image | `--img` / `--img-gen` | works (live: 1 PNG saved) |
-| Create video / Create music | `--save-videos` / `--save-media` | save-only: ask in a prompt, media is saved from the response |
+| Create video / Create music | `--video PROMPT` / `--music PROMPT` | generation path added in 4.5: media tool flag injected into the StreamGenerate payload (prime turn → media turn → poll `read_chat` for the finished file); `--save-videos` / `--save-media` choose the download dir |
 | Canvas | `--extract-canvas FILE` | save-only |
 | Deep research | `--deep-research` | DEGRADED on the current build: plan creation returns empty, the fallback returns a stub — now fails `DR_FAILED` instead of `ok:true` |
 | Guided Learning | — | web-only, not exposed via WebAPI |
@@ -89,6 +90,47 @@ Functions:
 | Temporary chat | `--temporary` | works |
 | Chat history | `--list-chats` | fails `LIST_CHATS_FAILED` when Gemini Activity is off (live: ppoppo205, error 1041 "Turn on Gemini Activity to use this feature"); turn Activity on in Gemini settings and it lists; `--read-chat <cid>` / `--fetch-latest <cid>` work regardless |
 | Dictate | — | N/A for a CLI |
+
+### Fixed in 4.5 (live-verified 2026-11-14, server build 20261113)
+
+Video/music generation now works through the CLI. gemini-webapi 2.1.1
+exposes no Create video/music mode, so both CLIs inject the web's media
+tool flag into the StreamGenerate payload (prime turn → media turn with
+the flag → poll `read_chat` for the finished file). New flags:
+`--video PROMPT` / `--music PROMPT` / `--aspect portrait`,
+`--save-videos` / `--save-media` choose the download dir. Timeout
+auto-extends (video 600s, music 300s); a quota/subscription verdict on
+the newest turn ends the poll early instead of burning the timeout.
+
+1. **Music is GREEN.** `--music` produced a real track on ppoppo205 at
+   20:41 HKT (66s: MP3 1.5 MB 192 kbps + MP4 4.3 MB + cover art,
+   conversation `c_639f5a0bbff02910`, file `ready_to_fly.mp4`). The
+   first attempt failed only because the account quota was exhausted
+   (0/600 credits, reset 20:40:02) — the retry after the reset worked.
+2. **Video pipeline verified, account-gated.** `--video` reaches the
+   Veo tool and the server's verdict surfaces cleanly in ~31s
+   (`MEDIA_QUOTA`: "If you upgrade your subscription, I can create
+   that video for you today"). A finished clip is unverifiable on the
+   free account — it needs Pro/Ultra. The mechanism is the same one
+   music proved, with the gemini-3-video model header. Caveat: the
+   video turn is nondeterministic on this account — gem-cli.py's two
+   attempts stalled instead (400s cut off, then a full 600s poll ending
+   on a "_923" fragment, no verdict), so its video leg is not verified
+   even though it runs identical code. A failed media run now prints
+   the conversation id (`cid`) so the stalled turn can be re-read.
+3. **Poll-verdict bug fixed.** The first runs reported `MEDIA_FAILED
+   "READY"` — the poll read the prime turn's text as the verdict. Only
+   the newest model turn's text now counts. Offline suite 39/39
+   (10 new media tests, incl. this regression and the cid test).
+
+Still blocked (server/session, not CLI): **deep research produces no
+report on this session** — the plan is created and the research runs
+(~14 min), but the final output is a stub, so the CLI fails `DR_FAILED`
+instead of reporting success. Needs a fully live session to confirm
+whether it works there. **Image generation quota was exhausted at the
+time of the probe** (`--img` path itself works — the deep test saved
+1 PNG earlier). **`-m thinking` still fails fast**
+(no `*THINKING` in the library enum).
 
 ### Fixed in 4.4 (live deep test 2026-11-14, server build 20261113)
 
@@ -121,15 +163,6 @@ Fixes from the deep test:
    session (~3/5 attempts return empty or a refusal). Both CLIs now
    retry plan creation up to 3 times (15s apart) instead of failing the
    whole run on the first miss.
-
-Still blocked (server/session, not CLI): **deep research produces no
-report on this session** — the plan is created and the research runs
-(~14 min), but the final output is a stub, so the CLI fails `DR_FAILED`
-instead of reporting success. Needs a fully live session to confirm
-whether it works there. **Create video/music have no generation path**
-in gemini-webapi 2.1.1 — `--save-videos` / `--save-media` only save
-media the model returns in chat. **`-m thinking` still fails fast**
-(no `*THINKING` in the library enum).
 
 ### Fixed in 4.3 (live-verified 2026-11-14, server build 20261113)
 

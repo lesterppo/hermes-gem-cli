@@ -142,8 +142,10 @@ class TestArgSurface(unittest.TestCase):
         src = inspect.getsource(g)
         for flag in ("--doctor", "--list-gems", "--list-chats", "--read-chat",
                      "--deep-research-status", "--create-gem", "--delete-gem",
-                     "--save-images", "--extract-canvas", "--show-thoughts",
-                     "--temporary", "--stream", "--fetch-latest"):
+                     "--save-images", "--save-videos", "--save-media",
+                     "--extract-canvas", "--show-thoughts",
+                     "--temporary", "--stream", "--fetch-latest",
+                     "--video", "--music", "--aspect"):
             self.assertIn('"%s"' % flag, src, "missing flag %s" % flag)
 
     def test_dr_status_takes_a_chat_id_not_a_task_id(self):
@@ -325,6 +327,159 @@ class TestImportSafety(unittest.TestCase):
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr[-400:])
         self.assertIn("SURVIVED True", r.stdout)
+
+
+class TestMediaGeneration(unittest.TestCase):
+    """The video/music tool-flag injection must rewrite exactly the
+    StreamGenerate payload shape, only while the media contextvar is set,
+    and never touch other serialisations."""
+
+    def _payload(self):
+        # Library payload shape in gemini-webapi 2.1.1: 81 wide, first
+        # element is message_content, inner[17] is the image selector.
+        p = [None] * 81
+        p[0] = [None] * 10
+        p[17] = [[0]]
+        return p
+
+    class _FakeJson:
+        def dumps(self, obj, *a, **k):
+            return b"{}"
+
+    def _run_proxy(self, mode, aspect=g._ASPECT_LANDSCAPE):
+        p = self._payload()
+        proxy = g._MediaJsonProxy(self._FakeJson())
+        t1 = g._media_ctx.set(mode)
+        t2 = g._media_aspect.set(aspect)
+        try:
+            proxy.dumps(p)
+        finally:
+            g._media_ctx.reset(t1)
+            g._media_aspect.reset(t2)
+        return p
+
+    def test_payload_shape_detection(self):
+        self.assertTrue(g._is_generate_payload(self._payload()))
+        self.assertFalse(g._is_generate_payload([None] * 68))
+        self.assertFalse(g._is_generate_payload(["x"] + [None] * 80))
+        self.assertFalse(g._is_generate_payload({"a": 1}))
+        self.assertFalse(g._is_generate_payload("not a payload"))
+
+    def test_video_landscape_rewrite(self):
+        p = self._run_proxy("video")
+        self.assertEqual(p[0][9], g._MEDIA_TOOL)
+        self.assertEqual(p[17], [[1]])
+        self.assertEqual(p[54], [])
+        self.assertEqual(p[55], [[g._ASPECT_LANDSCAPE]])
+
+    def test_video_portrait_rewrite(self):
+        p = self._run_proxy("video", aspect=g._ASPECT_PORTRAIT)
+        self.assertEqual(p[0][9], g._MEDIA_TOOL_PORTRAIT)
+        self.assertEqual(p[55], [[g._ASPECT_PORTRAIT]])
+
+    def test_music_sets_flag_but_no_video_selectors(self):
+        p = self._run_proxy("music")
+        self.assertEqual(p[0][9], g._MEDIA_TOOL)
+        self.assertEqual(p[17], [[1]])
+        self.assertIsNone(p[54])
+        self.assertIsNone(p[55])
+
+    def test_no_contextvar_means_no_rewrite(self):
+        p = self._payload()
+        g._MediaJsonProxy(self._FakeJson()).dumps(p)
+        self.assertIsNone(p[0][9])
+        self.assertEqual(p[17], [[0]])
+
+    def test_non_generate_payload_passes_through(self):
+        other = {"rpc": "CNgdBe", "data": [1, 2, 3]}
+        tok = g._media_ctx.set("video")
+        try:
+            g._MediaJsonProxy(self._FakeJson()).dumps(other)
+        finally:
+            g._media_ctx.reset(tok)
+        self.assertEqual(other, {"rpc": "CNgdBe", "data": [1, 2, 3]})
+
+    def test_quota_text_detection(self):
+        for t in ("You've reached your usage limit for music generation",
+                  "I can create that video if you upgrade your subscription",
+                  "quota exceeded, resets at 7:40 AM"):
+            self.assertTrue(g._looks_like_quota(t), t)
+        self.assertFalse(g._looks_like_quota("Here's your video!"))
+        self.assertFalse(g._looks_like_quota(""))
+
+    def test_poll_ignores_older_prime_turn_text(self):
+        """Regression (live 2026-11-14): the prime turn's 'READY' leaked
+        into the verdict when the media turn had no text, so a quota-starved
+        run reported MEDIA_FAILED 'READY'. Only the newest model turn's
+        text is the verdict."""
+        import asyncio
+
+        class _Out:
+            def __init__(self): self.videos = []; self.media = []
+        class _Turn:
+            def __init__(self, role, text):
+                self.role = role; self.text = text; self.model_output = _Out()
+        class _Hist:
+            def __init__(self, turns): self.turns = turns
+        class _Client:
+            async def read_chat(self, cid, limit=2):
+                # Newest-first: media turn (no text yet), then prime turn.
+                return _Hist([_Turn("model", ""), _Turn("model", "READY")])
+        media, text = asyncio.run(g._poll_media(_Client(), "c_x", "music",
+                                                timeout=0.3, interval=0.1))
+        self.assertIsNone(media)
+        self.assertEqual(text, "")
+
+    def test_poll_stops_early_on_repeated_quota_verdict(self):
+        """A quota/subscription verdict repeated on the newest turn ends
+        the poll early instead of burning the whole timeout."""
+        import asyncio
+        import time
+
+        class _Out:
+            def __init__(self): self.videos = []; self.media = []
+        class _Turn:
+            def __init__(self, role, text):
+                self.role = role; self.text = text; self.model_output = _Out()
+        class _Hist:
+            def __init__(self, turns): self.turns = turns
+        class _Client:
+            async def read_chat(self, cid, limit=2):
+                return _Hist([_Turn("model", "usage limit reached, resets at 7:40 AM")])
+        t0 = time.monotonic()
+        media, text = asyncio.run(g._poll_media(_Client(), "c_x", "music",
+                                                timeout=60, interval=0.05))
+        self.assertIsNone(media)
+        self.assertIn("limit", text)
+        self.assertLess(time.monotonic() - t0, 5.0)
+
+    def test_media_stopped_carries_cid(self):
+        """A stalled media turn must report its conversation id so the
+        turn can be re-read with --read-chat afterwards."""
+        import asyncio
+
+        class _Out:
+            def __init__(self): self.videos = []; self.media = []
+        class _Turn:
+            def __init__(self, role, text):
+                self.role = role; self.text = text; self.model_output = _Out()
+        class _Hist:
+            def __init__(self, turns): self.turns = turns
+        class _Chat:
+            cid = "c_test123"
+            model = None
+            async def send_message(self, prompt):
+                return None
+        class _Client:
+            def start_chat(self):
+                return _Chat()
+            async def read_chat(self, cid, limit=2):
+                return _Hist([_Turn("model", "usage limit reached")])
+        with self.assertRaises(g.MediaStopped) as cm:
+            asyncio.run(g._generate_media(_Client(), "a song", "music",
+                                          timeout=60))
+        self.assertEqual(cm.exception.cid, "c_test123")
+        self.assertIn("limit", str(cm.exception))
 
 
 if __name__ == "__main__":
