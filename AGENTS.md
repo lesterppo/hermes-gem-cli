@@ -85,13 +85,20 @@ Auth is resolved in this priority order:
 
 ## Model + thinking combinations
 
+Shorthands resolve against the account's **live** registered models first,
+then fall back to the `Model` enum, which the library maps onto the
+account's equivalent registered model (live-verified 2026-11-14: the server
+registers only `gemini-自動`, so every shorthand lands on the account
+default; no Hydrogen name is exposed via WebAPI).
+
 ```
--m flash                        → flash
+-m flash                        → flash+standard (BASIC_FLASH)
 -m flash --thinking extended    → flash+extended
--m pro                          → pro
+-m pro                          → pro+standard (BASIC_PRO)
 -m pro --thinking extended      → pro+extended
--m thinking                     → thinking+standard
--m thinking --thinking extended → thinking+extended
+-m lite                         → lite+standard (BASIC_LITE)
+-m thinking                     → FAILS FAST (GEN_FAILED: no *THINKING
+                                  member in gemini-webapi 2.1.1's Model enum)
 ```
 
 ## Error handling
@@ -116,7 +123,7 @@ Conversation state is a JSON file — portable between machines.
 ## Discovery
 
 ```bash
-gem-cli --list-models    # {"ok":true,"models":["gemini-3-flash",...]}
+gem-cli --list-models    # {"ok":true,"models":["gemini-自動"]} — the live registry; old gemini-3-* names are gone
 gem-cli --list-gems      # {"ok":true,"gems":[{"id":"...","name":"...","type":"user"},...]}
 gem-cli "<url>" --gem-info  # {"ok":true,"gem":{"id":"...","name":"...","type":"external"}}
 ```

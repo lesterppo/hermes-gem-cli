@@ -160,6 +160,89 @@ class TestArgSurface(unittest.TestCase):
         self.assertIn('"order": "oldest-first"', src)
 
 
+class TestModelResolution(unittest.TestCase):
+    """-m must resolve against the LIVE registry, not the old gemini-3-* names.
+
+    Live-verified 2026-11-14 against server build 20261113: the registry
+    lists only "gemini-自動", so every shorthand used to reach
+    generate_content as an unregistered string and fail with
+    "Unknown model name". The enum fallback lets the library map the
+    shorthand onto the account's equivalent registered model."""
+
+    class _FakeModel:
+        def __init__(self, model_id, display):
+            self.model_id = model_id
+            self._display = display
+        def __str__(self):
+            return self._display
+
+    class _StubClient:
+        def __init__(self, models):
+            self._models = models
+        def list_models(self):
+            return self._models
+
+    def _auto_only(self):
+        return self._StubClient([self._FakeModel("auto-id-1", "gemini-自動")])
+
+    def test_shorthands_fall_back_to_enum_on_auto_only_registry(self):
+        if g.GeminiModel is None:
+            self.skipTest("gemini-webapi not importable here")
+        self.assertEqual(g.resolve_model_string(self._auto_only(), "flash").name, "BASIC_FLASH")
+        self.assertEqual(g.resolve_model_string(self._auto_only(), "pro").name, "BASIC_PRO")
+
+    def test_thinking_has_no_enum_member_in_this_library(self):
+        # gemini-webapi 2.1.1's Model enum has no *THINKING members, so
+        # there is nothing to fall back to: the name passes through and
+        # the library fails fast naming the available models, rather than
+        # the CLI silently substituting a different model.
+        self.assertEqual(g.resolve_model_string(self._auto_only(), "thinking"), "thinking")
+
+    def test_lite_keeps_dict_spec_on_auto_only_registry(self):
+        self.assertIsInstance(g.resolve_model_string(self._auto_only(), "lite"), dict)
+
+    def test_unknown_name_passes_through_for_library_error(self):
+        # A future name (e.g. hydrogen) must not be silently rewritten:
+        # either the registry lists it one day, or the library fails fast
+        # naming the available models.
+        self.assertEqual(g.resolve_model_string(self._auto_only(), "hydrogen"), "hydrogen")
+
+    def test_registry_match_still_wins_when_registered(self):
+        client = self._StubClient([self._FakeModel("56fdd199312815e2", "gemini-3-flash")])
+        self.assertEqual(g.resolve_model_string(client, "flash"), "gemini-3-flash")
+
+
+class TestStdinRead(unittest.TestCase):
+    """_read_stdin_if_piped must not hang forever on an open pipe.
+
+    Live-verified 2026-11-14: direct chat with -p hung with zero output
+    when spawned with an open stdin pipe, because sys.stdin.read() waits
+    for EOF; stdin=/dev/null answered in seconds."""
+
+    def test_open_idle_pipe_returns_empty_fast(self):
+        r, w = os.pipe()
+        old = sys.stdin
+        try:
+            sys.stdin = os.fdopen(r, "r")
+            t0 = __import__("time").monotonic()
+            self.assertEqual(g._read_stdin_if_piped(timeout=0.2), "")
+            self.assertLess(__import__("time").monotonic() - t0, 1.5)
+        finally:
+            sys.stdin = old
+            os.close(w)
+
+    def test_piped_data_is_still_consumed(self):
+        r, w = os.pipe()
+        os.write(w, b"piped words")
+        os.close(w)
+        old = sys.stdin
+        try:
+            sys.stdin = os.fdopen(r, "r")
+            self.assertEqual(g._read_stdin_if_piped(timeout=0.2), "piped words")
+        finally:
+            sys.stdin = old
+
+
 class TestImportSafety(unittest.TestCase):
     def test_import_without_optional_deps_does_not_exit(self):
         """The CLI exits(1) with DEP_MISSING when run without gemini-webapi, but

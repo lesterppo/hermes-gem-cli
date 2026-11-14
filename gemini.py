@@ -144,6 +144,8 @@ _MODEL_LABEL_MAP = {
     "BASIC_FLASH": "flash+standard",  "PLUS_FLASH": "flash+plus",
     "ADVANCED_FLASH": "flash+extended", "BASIC_PRO": "pro+standard",
     "PLUS_PRO": "pro+plus", "ADVANCED_PRO": "pro+extended",
+    "BASIC_LITE": "lite+standard", "PLUS_LITE": "lite+plus",
+    "ADVANCED_LITE": "lite+extended",
     "BASIC_THINKING": "thinking+standard", "PLUS_THINKING": "thinking+plus",
     "ADVANCED_THINKING": "thinking+extended",
     "gemini-3-flash": "flash", "gemini-3-pro": "pro",
@@ -179,6 +181,34 @@ def friendly_model_label(model) -> str:
     if isinstance(model, str):
         return _MODEL_LABEL_MAP.get(model, model.lower())
     return str(model)
+
+
+def _read_stdin_if_piped(timeout: float = 2.0) -> str:
+    """Read piped stdin without hanging forever on an open pipe.
+
+    The CLI appends piped stdin to -p (and accepts a bare piped prompt),
+    but a plain sys.stdin.read() blocks until EOF. An agent harness that
+    spawns the CLI with an open stdin pipe hangs forever with no output
+    and no timeout (live-verified 2026-11-14: direct chat with -p hung
+    with zero output; stdin=/dev/null answered in seconds). Wait briefly
+    for the first byte; if nothing arrives, treat stdin as empty. A real
+    pipe (cat/echo) has its data buffered immediately, so it is still
+    consumed; a tty is never read here.
+    """
+    if sys.stdin.isatty():
+        return ""
+    try:
+        import select
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not ready:
+            return ""
+    except Exception:
+        return ""
+    try:
+        return sys.stdin.read().strip()
+    except Exception:
+        return ""
+
 
 def _supports(fn, param: str) -> bool:
     """True when a library callable accepts `param` (lib versions drift)."""
@@ -218,15 +248,28 @@ def resolve_model_string(client, model_str: str) -> str:
     matches = [v for k, v in name_map.items() if q in k]
     if len(matches) == 1: return matches[0]
     if q in ("flash", "fast"):
-        return next((v for k, v in name_map.items()
-                     if "flash" in k and "lite" not in k and "thinking" not in k), model_str)
+        hit = next((v for k, v in name_map.items()
+                    if "flash" in k and "lite" not in k and "thinking" not in k), None)
+        if hit: return hit
     if q in ("pro",):
-        return next((v for k, v in name_map.items()
-                     if "pro" in k and "thinking" not in k), model_str)
+        hit = next((v for k, v in name_map.items()
+                    if "pro" in k and "thinking" not in k), None)
+        if hit: return hit
     if q in ("lite",):
         matches = [v for k, v in name_map.items() if "flash-lite" in k.lower() or "lite" in k.lower()]
         if matches: return matches[0]
         return dict(_LITE_MODEL_DICT)
+    # No live-registry match: the server no longer registers the old
+    # gemini-3-* names (live-verified 2026-11-14: the registry lists only
+    # "gemini-自動"). Fall back to the Model enum — the library maps it
+    # onto the account's equivalent registered model. Returning the raw
+    # string fails in generate_content with "Unknown model name".
+    mtype = _MODEL_ALIASES.get(q)
+    if mtype is not None:
+        try:
+            return GeminiModel[f"BASIC_{mtype}"]
+        except (AttributeError, KeyError):
+            pass
     return model_str
 
 # ── 5-tier auth chain ────────────────────────────────────────
@@ -1076,16 +1119,17 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         if args.create_gem_name:
             if args.prompt_flag:
                 sys_prompt = args.prompt_flag
-                if not sys.stdin.isatty():
-                    stdin_content = sys.stdin.read().strip()
-                    if stdin_content:
-                        sys_prompt = f"{sys_prompt}\n\n{stdin_content}"
+                stdin_content = _read_stdin_if_piped()
+                if stdin_content:
+                    sys_prompt = f"{sys_prompt}\n\n{stdin_content}"
             elif args.edit_sys_instr:
                 sys_prompt = args.edit_sys_instr
             elif args.prompt:
                 sys_prompt = " ".join(args.prompt)
             elif not sys.stdin.isatty():
-                sys_prompt = sys.stdin.read().strip()
+                sys_prompt = _read_stdin_if_piped()
+                if not sys_prompt:
+                    fail("NO_PROMPT", "Provide system prompt via -p, -S, stdin, or positional args.")
             else:
                 fail("NO_PROMPT", "Provide system prompt via -p, -S, stdin, or positional args.")
             sid, ts = resolve_auth(preferred_browser=args.browser or os.getenv("GEMINI_BROWSER"))
@@ -1358,16 +1402,15 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             args.image_gen = True
         elif args.prompt_flag:
             prompt = args.prompt_flag
-            if not sys.stdin.isatty():
-                stdin_content = sys.stdin.read().strip()
-                if stdin_content:
-                    prompt = f"{prompt}\n\n{stdin_content}"
+            stdin_content = _read_stdin_if_piped()
+            if stdin_content:
+                prompt = f"{prompt}\n\n{stdin_content}"
         elif args.prompt:
             prompt = " ".join(args.prompt)
         elif args.list_models or args.list_gems or args.gem_info:
             prompt = ""
         elif not sys.stdin.isatty():
-            prompt = sys.stdin.read().strip()
+            prompt = _read_stdin_if_piped()
             if not prompt: fail("NO_PROMPT", "No prompt provided.")
         elif args.image_gen:
             prompt = "Generate an image."
@@ -1507,8 +1550,15 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                               "created": datetime.now(timezone.utc).isoformat()}
 
         # ── Image gen force flash ──
+        # (enum, not the old "gemini-3-flash" string: that name is no
+        # longer registered — the library maps the enum onto the account's
+        # equivalent model. If the enum is unavailable, leave the model
+        # unset and let the server use its default.)
         if args.image_gen and not model:
-            model = "gemini-3-flash"
+            try:
+                model = GeminiModel.BASIC_FLASH
+            except AttributeError:
+                pass
 
         # ── Files ──
         all_files = []
@@ -1530,14 +1580,22 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         # An id that resolves to no library Gem is either a shared Gem or a typo —
         # for a typo the server accepts the request and simply never answers, so cap
         # the wait instead of burning the full timeout with no explanation.
-        if gem_unresolved and not args.deep_research and actual_timeout > 60:
+        # Direct (gem-less) chat gets the same bound: a request the server
+        # never answers should fail fast with a clear message, not burn the
+        # full timeout across retries.
+        direct_chat = not gem_id
+        if (gem_unresolved or direct_chat) and not args.deep_research and actual_timeout > 60:
             actual_timeout = 60
-            self.log("Gem id not found in your library (shared Gem?): probing with a 60s cap — raise with -t")
+            if gem_unresolved:
+                self.log("Gem id not found in your library (shared Gem?): probing with a 60s cap — raise with -t")
+            else:
+                self.log("Direct chat (no Gem): probing with a 60s cap — raise with -t")
 
         # ── Generate with retry ──
         # An unresolvable Gem id never becomes resolvable on retry, so retrying it
         # just multiplies the wait; one capped attempt gives a fast, clear failure.
-        max_attempts = 1 if (args.no_retry or gem_unresolved) else 3
+        # Same for direct chat: a never-answering request does not improve on retry.
+        max_attempts = 1 if (args.no_retry or gem_unresolved or direct_chat) else 3
         for attempt in range(max_attempts):
             if attempt > 0: self.log(f"Retry {attempt+1}/{max_attempts}...")
             try:
@@ -1647,8 +1705,14 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                         if pwj:
                             self.log(f"Browser fallback OK: {pwj.get('s',0)} chars")
                             print(json.dumps(pwj)); return
-                    _hint = (" Gem id was not found in your library — the id may be wrong, or "
-                             "it is a shared Gem you cannot access.") if gem_unresolved else ""
+                    if gem_unresolved:
+                        _hint = (" Gem id was not found in your library — the id may be wrong, or "
+                                 "it is a shared Gem you cannot access.")
+                    elif not gem_id:
+                        _hint = (" Direct chat got no answer — retry, raise the timeout "
+                                 "with -t, or try the same prompt through a Gem.")
+                    else:
+                        _hint = ""
                     fail("TIMEOUT", f"Timed out after {actual_timeout}s.{_hint}",
                          {"timeout_s": actual_timeout, "retry": False})
                 continue

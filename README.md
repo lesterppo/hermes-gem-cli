@@ -49,7 +49,7 @@ requests (~4s chat). This is 3-10x faster than browser automation.
 | File upload (PDF, TXT) | `gemini-cli <id> -f file.pdf "summarize"` | ~5s |
 | Image upload | `gemini-cli <id> -i photo.png "describe"` | ~5s |
 | Gem CRUD | `--create-gem` / `--delete-gem` / `--list-gems` | <1s |
-| Model selection | `-m flash` / `pro` / `lite` | — |
+| Model selection | `-m flash` / `pro` / `lite` (resolved against the account's live registered models) | — |
 | Extended thinking | `--thinking extended` | adds ~30-60s |
 | Temporary chat | `--temporary` | ephemeral, not in history |
 | Thinking traces | `--show-thoughts` | adds thoughts to output |
@@ -59,6 +59,40 @@ requests (~4s chat). This is 3-10x faster than browser automation.
 | Deep research status | `--deep-research-status c_xxx` | is the report in the chat yet? |
 | Auth diagnostics | `--doctor` | which cookie jar is live + capability probe |
 | Streaming output | `--stream` | real-time tokens |
+
+### Fixed in 4.2 (live-verified 2026-11-14, server build 20261113)
+
+The web Gemini picker now defaults to **Hydrogen Medium** (Gemini 4 Hydrogen),
+but the WebAPI exposes **no Hydrogen model name**: `--list-models` returns only
+`["gemini-自動"]`, and the old `gemini-3-*` names are gone from the registry.
+Three fixes, all live-verified against that build:
+
+1. **`-m` was broken for every choice.** `resolve_model_string()` returned the
+   raw shorthand (`flash`/`pro`/`lite`/`thinking`), which `generate_content`
+   rejects with `GEN_FAILED: Unknown model name`. Shorthands now resolve
+   against the live registry first, and fall back to the `Model` enum member
+   (`BASIC_FLASH`/`BASIC_PRO`/`BASIC_LITE`), which the library maps onto the
+   account's equivalent registered model. `-m thinking` still fails fast:
+   `gemini-webapi` 2.1.1's `Model` enum has no `*THINKING` members, so there
+   is nothing to map it to — the library error names the available models
+   instead of the CLI silently substituting a different model. Image
+   generation no longer hardcodes `gemini-3-flash` either (same enum).
+2. **Direct chat hung forever when spawned with an open stdin pipe.** `-p`
+   (and bare piped prompts) did a plain `sys.stdin.read()`, which blocks
+   until EOF — an agent harness with an open stdin pipe hung with zero
+   output and no timeout. Stdin is now read only if data arrives within
+   2s (`_read_stdin_if_piped`); a real pipe (`cat`/`echo`) is still
+   consumed, an idle pipe is treated as empty, and a tty is never read.
+3. **Direct chat now shares the 60s / single-attempt cap** already used for
+   unresolvable Gem ids, so a request the server never answers fails fast
+   with a clear `TIMEOUT` hint instead of burning the full timeout across
+   retries.
+
+Open: the CLI cannot select or report the underlying model behind `auto`
+(Hydrogen or otherwise) — that routing is server-side. `--account-status`
+also surfaces a non-fatal `quota_error` (`GRPC has no attribute
+'DEEP_RESEARCH_MODEL_STATE'`): a library/server drift, quota itself is
+unaffected.
 
 ### Fixed in 4.1 (live-verified 2026-09-20)
 

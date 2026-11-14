@@ -100,6 +100,9 @@ _MODEL_LABEL_MAP = {
     "BASIC_PRO": "pro+standard",
     "PLUS_PRO": "pro+plus",
     "ADVANCED_PRO": "pro+extended",
+    "BASIC_LITE": "lite+standard",
+    "PLUS_LITE": "lite+plus",
+    "ADVANCED_LITE": "lite+extended",
     "BASIC_THINKING": "thinking+standard",
     "PLUS_THINKING": "thinking+plus",
     "ADVANCED_THINKING": "thinking+extended",
@@ -118,6 +121,34 @@ def friendly_model_label(model) -> str:
     if isinstance(model, str):
         return _MODEL_LABEL_MAP.get(model, model.lower())
     return str(model)
+
+
+def _read_stdin_if_piped(timeout: float = 2.0) -> str:
+    """Read piped stdin without hanging forever on an open pipe.
+
+    The CLI appends piped stdin to -p (and accepts a bare piped prompt),
+    but a plain sys.stdin.read() blocks until EOF. An agent harness that
+    spawns the CLI with an open stdin pipe hangs forever with no output
+    and no timeout (live-verified 2026-11-14: direct chat with -p hung
+    with zero output; stdin=/dev/null answered in seconds). Wait briefly
+    for the first byte; if nothing arrives, treat stdin as empty. A real
+    pipe (cat/echo) has its data buffered immediately, so it is still
+    consumed; a tty is never read here.
+    """
+    if sys.stdin.isatty():
+        return ""
+    try:
+        import select
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not ready:
+            return ""
+    except Exception:
+        return ""
+    try:
+        return sys.stdin.read().strip()
+    except Exception:
+        return ""
+
 
 def _load_auth_cache() -> tuple[str | None, str | None]:
     """Tier 2: read cached tokens from ~/.gemini-cli/auth.json."""
@@ -267,8 +298,14 @@ def resolve_model_enum(model_str: str | None, thinking: str | None = None):
     mtype = _MODEL_ALIASES.get(model_str.lower().strip())
     if mtype is None:
         return model_str
-    if mtype == "LITE":
-        return "gemini-3-flash-lite"
+    if mtype == "LITE" and not tier:
+        # The old hardcoded "gemini-3-flash-lite" string is no longer a
+        # registered model name; the enum lets the library map it onto the
+        # account's equivalent registered model.
+        try:
+            return Model.BASIC_LITE
+        except AttributeError:
+            return "gemini-3-flash-lite"
     if tier:
         try:
             return Model[f"{tier}_{mtype}"]
@@ -314,14 +351,31 @@ def resolve_model_string(client, model_str: str) -> str:
     
     # Heuristic selection: prefer non-thinking, non-lite variants
     if q in ("flash", "fast"):
-        return next((v for k, v in name_map.items()
-                     if "flash" in k and "lite" not in k and "thinking" not in k), model_str)
+        hit = next((v for k, v in name_map.items()
+                    if "flash" in k and "lite" not in k and "thinking" not in k), None)
+        if hit:
+            return hit
     if q in ("pro",):
-        return next((v for k, v in name_map.items()
-                     if "pro" in k and "thinking" not in k), model_str)
+        hit = next((v for k, v in name_map.items()
+                    if "pro" in k and "thinking" not in k), None)
+        if hit:
+            return hit
     if q in ("lite",):
-        return next((v for k, v in name_map.items()
-                     if "lite" in k), model_str)
+        hit = next((v for k, v in name_map.items()
+                    if "lite" in k), None)
+        if hit:
+            return hit
+    # No live-registry match: the server no longer registers the old
+    # gemini-3-* names (live-verified 2026-11-14: the registry lists only
+    # "gemini-自動"). Fall back to the Model enum — the library maps it
+    # onto the account's equivalent registered model. Returning the raw
+    # string fails in generate_content with "Unknown model name".
+    mtype = _MODEL_ALIASES.get(q)
+    if mtype is not None:
+        try:
+            return Model[f"BASIC_{mtype}"]
+        except (AttributeError, KeyError):
+            pass
     return model_str
 
 # ── Conversation state ──────────────────────────────────────
@@ -561,14 +615,15 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             # Read system prompt from stdin, -p, or positional args
             if args.prompt_flag:
                 system_prompt = args.prompt_flag
-                if not sys.stdin.isatty():
-                    stdin_content = sys.stdin.read().strip()
-                    if stdin_content:
-                        system_prompt = f"{system_prompt}\n\n{stdin_content}"
+                stdin_content = _read_stdin_if_piped()
+                if stdin_content:
+                    system_prompt = f"{system_prompt}\n\n{stdin_content}"
             elif args.prompt:
                 system_prompt = " ".join(args.prompt)
             elif not sys.stdin.isatty():
-                system_prompt = sys.stdin.read().strip()
+                system_prompt = _read_stdin_if_piped()
+                if not system_prompt:
+                    fail("NO_PROMPT", "Provide system prompt via -p, stdin, or positional args.")
             else:
                 fail("NO_PROMPT", "Provide system prompt via -p, stdin, or positional args.")
             sid, ts = resolve_auth(
@@ -665,16 +720,15 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             args.image_gen = True
         elif args.prompt_flag:
             prompt = args.prompt_flag
-            if not sys.stdin.isatty():
-                stdin_content = sys.stdin.read().strip()
-                if stdin_content:
-                    prompt = f"{prompt}\n\n{stdin_content}"
+            stdin_content = _read_stdin_if_piped()
+            if stdin_content:
+                prompt = f"{prompt}\n\n{stdin_content}"
         elif args.prompt:
             prompt = " ".join(args.prompt)
         elif args.list_models or args.list_gems:
             prompt = ""
         elif not sys.stdin.isatty():
-            prompt = sys.stdin.read().strip()
+            prompt = _read_stdin_if_piped()
             if not prompt:
                 fail("NO_PROMPT", "No prompt provided.")
         elif args.image_gen:
@@ -778,8 +832,15 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 }
 
         # ── Force flash for image generation ──
+        # (enum, not the old "gemini-3-flash" string: that name is no
+        # longer registered — the library maps the enum onto the account's
+        # equivalent model. If the enum is unavailable, leave the model
+        # unset and let the server use its default.)
         if args.image_gen and not model:
-            model = "gemini-3-flash"
+            try:
+                model = Model.BASIC_FLASH
+            except AttributeError:
+                pass
 
         # ── Collect files ──
         all_files = []
