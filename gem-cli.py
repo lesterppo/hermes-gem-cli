@@ -112,6 +112,11 @@ _MODEL_LABEL_MAP = {
     "gemini-3-flash-lite": "lite",
     "gemini-3-flash-thinking": "thinking",
     "3.1 Flash-Lite": "lite",
+    # Live web names (2026-11-14 picker): the WebAPI registry lists only
+    # the account default, labelled "auto" in pointers.
+    "gemini-自動": "auto",
+    "4 Hydrogen": "hydrogen",
+    "3.5 Flash-Lite": "lite",
 }
 
 def friendly_model_label(model) -> str:
@@ -148,6 +153,20 @@ def _read_stdin_if_piped(timeout: float = 2.0) -> str:
         return sys.stdin.read().strip()
     except Exception:
         return ""
+
+
+def _dr_is_stub(text) -> bool:
+    """True when a deep-research result is a stub, not a report.
+
+    Live-verified 2026-11-14: with plan creation failing, the fallback
+    generate returns a plan-acknowledgement sentence (~80 chars) instead
+    of a report. Reporting ok:true for that misleads agents into thinking
+    the research ran. Deep-research reports are long; anything under 200
+    chars is a stub.
+    """
+    if not text:
+        return True
+    return len(str(text).strip()) < 200
 
 
 def _load_auth_cache() -> tuple[str | None, str | None]:
@@ -282,12 +301,22 @@ _MODEL_ALIASES = {
     "pro": "PRO", "flash": "FLASH", "fast": "FLASH",
     "thinking": "THINKING", "think": "THINKING",
     "lite": "LITE",
+    # Web picker names (2026-11-14): "Quick answers" is 3.5 Flash-Lite.
+    "flash-lite": "LITE", "3.5 flash-lite": "LITE", "3.5-flash-lite": "LITE",
 }
+
+# Web picker names for "Everyday help" (4 Hydrogen). Hydrogen is NOT a
+# registered WebAPI model name — the registry lists only the account
+# default (auto) — so these resolve to that registered default instead
+# of failing. See resolve_model_string.
+_HYDROGEN_NAMES = {"hydrogen", "4 hydrogen", "hydrogen medium"}
 
 _THINKING_ALIASES = {
     "standard": "BASIC", "basic": "BASIC",
     "plus": "PLUS",
     "extended": "ADVANCED", "advanced": "ADVANCED",
+    # Web picker "Thinking level" names (2026-11-14).
+    "low": "BASIC", "medium": "PLUS", "high": "ADVANCED",
 }
 
 def resolve_model_enum(model_str: str | None, thinking: str | None = None):
@@ -365,6 +394,12 @@ def resolve_model_string(client, model_str: str) -> str:
                     if "lite" in k), None)
         if hit:
             return hit
+    # Web picker name for "Everyday help" (4 Hydrogen): not a registered
+    # WebAPI model name. Accept it and use the registry's default (the
+    # account's auto model — the same default a bare run uses), instead of
+    # passing an unknown name to generate_content.
+    if q.replace("-", " ") in _HYDROGEN_NAMES and len(name_map) == 1:
+        return next(iter(name_map.values()))
     # No live-registry match: the server no longer registers the old
     # gemini-3-* names (live-verified 2026-11-14: the registry lists only
     # "gemini-自動"). Fall back to the Model enum — the library maps it
@@ -510,11 +545,13 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                             help="Start fresh conversation")
         # Model
         parser.add_argument("-m", "--model", type=str, metavar="MODEL",
-                            choices=["flash", "pro", "thinking", "lite"],
-                            help="Model: flash (fast), pro (deep), thinking, lite")
+                            choices=["flash", "pro", "thinking", "lite",
+                                     "hydrogen", "flash-lite"],
+                            help="Model: flash, pro, thinking, lite, hydrogen (web default), flash-lite")
         parser.add_argument("--thinking", type=str, metavar="TIER",
-                            choices=["standard", "plus", "extended"],
-                            help="Thinking tier: standard, plus, extended")
+                            choices=["standard", "plus", "extended",
+                                     "low", "medium", "high"],
+                            help="Thinking tier: standard/low, plus/medium, extended/high")
         # Image generation
         parser.add_argument("--img-gen", action="store_true", dest="image_gen",
                             help="Force image generation mode")
@@ -954,6 +991,12 @@ Output: compact JSON pointer on stdout, full response on disk.""")
 
             # Success — process response
             text = response.text
+            if args.deep_research and _dr_is_stub(text):
+                fail("DR_FAILED",
+                     "Deep research returned no report (plan creation failed and the "
+                     "fallback returned only a stub). The account/session may not "
+                     "support deep research on this build.",
+                     {"retry": False})
             new_meta = list(response.metadata) if response.metadata else None
 
             images_out = []

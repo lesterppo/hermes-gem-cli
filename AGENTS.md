@@ -97,8 +97,12 @@ default; no Hydrogen name is exposed via WebAPI).
 -m pro                          → pro+standard (BASIC_PRO)
 -m pro --thinking extended      → pro+extended
 -m lite                         → lite+standard (BASIC_LITE)
+-m flash-lite                   → lite+standard (web name for 3.5 Flash-Lite)
+-m hydrogen                     → auto (web name for 4 Hydrogen; WebAPI has
+                                  no Hydrogen name, resolves to the default)
 -m thinking                     → FAILS FAST (GEN_FAILED: no *THINKING
                                   member in gemini-webapi 2.1.1's Model enum)
+--thinking low / medium / high  → standard / plus / extended (web Thinking level)
 ```
 
 ## Error handling

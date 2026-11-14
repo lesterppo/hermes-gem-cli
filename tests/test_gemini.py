@@ -202,14 +202,33 @@ class TestModelResolution(unittest.TestCase):
         self.assertIsInstance(g.resolve_model_string(self._auto_only(), "lite"), dict)
 
     def test_unknown_name_passes_through_for_library_error(self):
-        # A future name (e.g. hydrogen) must not be silently rewritten:
+        # A future name (e.g. a new model family) must not be silently rewritten:
         # either the registry lists it one day, or the library fails fast
-        # naming the available models.
-        self.assertEqual(g.resolve_model_string(self._auto_only(), "hydrogen"), "hydrogen")
+        # naming the available models. ("hydrogen" used to be the example
+        # here; it is now a known web name that resolves to the default.)
+        self.assertEqual(g.resolve_model_string(self._auto_only(), "quantum"), "quantum")
 
     def test_registry_match_still_wins_when_registered(self):
         client = self._StubClient([self._FakeModel("56fdd199312815e2", "gemini-3-flash")])
         self.assertEqual(g.resolve_model_string(client, "flash"), "gemini-3-flash")
+
+    def test_web_picker_names(self):
+        # Web picker (2026-11-14): "Quick answers" = 3.5 Flash-Lite,
+        # "Everyday help" = 4 Hydrogen. Hydrogen is not a registered WebAPI
+        # name, so it resolves to the registry's single default (auto).
+        if g.GeminiModel is None:
+            self.skipTest("gemini-webapi not importable here")
+        self.assertEqual(g.resolve_model_string(self._auto_only(), "3.5 flash-lite").name,
+                         "BASIC_LITE")
+        self.assertEqual(g.resolve_model_string(self._auto_only(), "hydrogen"), "gemini-自動")
+        self.assertEqual(g.resolve_model_string(self._auto_only(), "4 hydrogen"), "gemini-自動")
+        self.assertEqual(g.friendly_model_label("gemini-自動"), "auto")
+
+    def test_thinking_level_web_names(self):
+        # Web picker "Thinking level": Low / Medium / High.
+        self.assertEqual(g.resolve_model_enum("flash", "high").name, "ADVANCED_FLASH")
+        self.assertEqual(g.resolve_model_enum("flash", "low").name, "BASIC_FLASH")
+        self.assertEqual(g.resolve_model_enum("pro", "medium").name, "PLUS_PRO")
 
 
 class TestStdinRead(unittest.TestCase):
@@ -241,6 +260,20 @@ class TestStdinRead(unittest.TestCase):
             self.assertEqual(g._read_stdin_if_piped(timeout=0.2), "piped words")
         finally:
             sys.stdin = old
+
+
+class TestDrStub(unittest.TestCase):
+    """A stub is not a report: --deep-research must fail DR_FAILED instead
+    of ok:true when plan creation fails and the fallback returns only a
+    plan-acknowledgement sentence (live-verified 2026-11-14: 78 chars)."""
+
+    def test_stub_detection(self):
+        self.assertTrue(g._dr_is_stub(None))
+        self.assertTrue(g._dr_is_stub(""))
+        self.assertTrue(g._dr_is_stub("Here's my plan to tackle that topic. "
+                                      "Let me know if you need to make changes."))
+        self.assertFalse(g._dr_is_stub("x" * 200))
+        self.assertFalse(g._dr_is_stub("## Report\n\n" + "detail. " * 100))
 
 
 class TestImportSafety(unittest.TestCase):

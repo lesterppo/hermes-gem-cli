@@ -60,6 +60,56 @@ requests (~4s chat). This is 3-10x faster than browser automation.
 | Auth diagnostics | `--doctor` | which cookie jar is live + capability probe |
 | Streaming output | `--stream` | real-time tokens |
 
+### Web Gemini vs WebAPI (mapped 2026-11-14, account cyc236ha Plus)
+
+Models — the web picker has two modes plus a Thinking level. WebAPI exposes
+only the account default (`gemini-自動`), so every CLI shorthand lands on it:
+
+| Web picker | CLI | Status |
+|------------|-----|--------|
+| Quick answers — 3.5 Flash-Lite | `-m lite` / `-m flash-lite` | works |
+| Everyday help — 4 Hydrogen | `-m hydrogen` | accepted; resolves to the account default (auto) — no Hydrogen name exists in WebAPI |
+| Thinking level Low / Medium / High | `--thinking low` / `medium` / `high` | works (= standard / plus / extended) |
+| — | `--list-models` | returns only `["gemini-自動"]` |
+
+Functions:
+
+| Web function | CLI | Status |
+|--------------|-----|--------|
+| Create image | `--img` / `--img-gen` | works (live: 1 PNG saved) |
+| Create video / Create music | `--save-videos` / `--save-media` | save-only: ask in a prompt, media is saved from the response |
+| Canvas | `--extract-canvas FILE` | save-only |
+| Deep research | `--deep-research` | DEGRADED on the current build: plan creation returns empty, the fallback returns a stub — now fails `DR_FAILED` instead of `ok:true` |
+| Guided Learning | — | web-only, not exposed via WebAPI |
+| Notebooks | — | web-only |
+| Scheduled / Daily brief | — | web-only |
+| Personal Intelligence (Labs), Skills, Avatar, Developer Mode | — | settings; web-only |
+| Add from Drive / Google Photos | — | web-only (CLI: local `-f` / `-i` upload only) |
+| Gems | Gem chat + `--create-gem` / `--delete-gem` / `--list-gems` | works |
+| Temporary chat | `--temporary` | works |
+| Chat history | `--list-chats` | returns `[]` on a degraded session; `--read-chat <cid>` / `--fetch-latest <cid>` work |
+| Dictate | — | N/A for a CLI |
+
+### Fixed in 4.3 (live-verified 2026-11-14, server build 20261113)
+
+1. **Web model names accepted.** `-m hydrogen` and `-m flash-lite`, plus
+   `--thinking low` / `medium` / `high` (the web picker's Thinking level
+   names). Hydrogen resolves to the registry's single default (`auto`);
+   Flash-Lite resolves to the `LITE` enum. Full-suite live test: 23/23
+   offline, and every CLI function verified live except deep research —
+   Gem chat (`-m flash`/`pro`/`lite`/`hydrogen`/`flash-lite`), direct
+   chat, multi-turn (memory across turns verified with a coding question),
+   `--temporary`, `--stream`, `--show-thoughts`, `--img` (1 PNG),
+   Gem create+delete, `--read-chat`, `--fetch-latest`, `--gem-info`.
+   `-m thinking` still fails fast (no `*THINKING` in the library enum).
+2. **Deep research no longer reports success for a stub.** With plan
+   creation returning empty, the fallback emitted a ~80-char
+   plan-acknowledgement and the CLI printed `ok:true` (once with a 0-byte
+   file). Both CLIs now fail `DR_FAILED` when the result is a stub.
+3. **`--list-chats` returns `[]`** on the degraded (non-live) session
+   even though chats exist — `--read-chat` by id works. Likely
+   SNlM0e-gated; needs a fully live session to confirm.
+
 ### Fixed in 4.2 (live-verified 2026-11-14, server build 20261113)
 
 The web Gemini picker now defaults to **Hydrogen Medium** (Gemini 4 Hydrogen),

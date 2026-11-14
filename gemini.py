@@ -153,6 +153,9 @@ _MODEL_LABEL_MAP = {
     "Flash-Lite": "lite", "gemini-flash-lite": "lite",
     "gemini-flash": "flash", "gemini-pro": "pro",
     "gemini-3-flash-thinking": "thinking", "3.5 Flash-Lite": "lite",
+    # Live web names (2026-11-14 picker): the WebAPI registry lists only
+    # the account default, labelled "auto" in pointers.
+    "gemini-自動": "auto", "4 Hydrogen": "hydrogen",
 }
 
 _LITE_MODEL_DICT = {
@@ -165,9 +168,18 @@ _LITE_MODEL_DICT = {
 }
 
 _MODEL_ALIASES = {"pro": "PRO", "flash": "FLASH", "fast": "FLASH",
-                   "thinking": "THINKING", "think": "THINKING", "lite": "LITE"}
+                   "thinking": "THINKING", "think": "THINKING", "lite": "LITE",
+                   # Web picker names (2026-11-14): "Quick answers" is 3.5 Flash-Lite.
+                   "flash-lite": "LITE", "3.5 flash-lite": "LITE", "3.5-flash-lite": "LITE"}
+# Web picker names for "Everyday help" (4 Hydrogen). Hydrogen is NOT a
+# registered WebAPI model name — the registry lists only the account
+# default (auto) — so these resolve to that registered default instead
+# of failing. See resolve_model_string.
+_HYDROGEN_NAMES = {"hydrogen", "4 hydrogen", "hydrogen medium"}
 _THINKING_ALIASES = {"standard": "BASIC", "basic": "BASIC",
-                      "plus": "PLUS", "extended": "ADVANCED", "advanced": "ADVANCED"}
+                      "plus": "PLUS", "extended": "ADVANCED", "advanced": "ADVANCED",
+                      # Web picker "Thinking level" names (2026-11-14).
+                      "low": "BASIC", "medium": "PLUS", "high": "ADVANCED"}
 
 def friendly_model_label(model) -> str:
     # No -m: the account default is used, and "None" in the pointer read like a bug
@@ -208,6 +220,20 @@ def _read_stdin_if_piped(timeout: float = 2.0) -> str:
         return sys.stdin.read().strip()
     except Exception:
         return ""
+
+
+def _dr_is_stub(text) -> bool:
+    """True when a deep-research result is a stub, not a report.
+
+    Live-verified 2026-11-14: with plan creation failing, the fallback
+    generate returns a plan-acknowledgement sentence (~80 chars) instead
+    of a report. Reporting ok:true for that misleads agents into thinking
+    the research ran. Deep-research reports are long; anything under 200
+    chars is a stub.
+    """
+    if not text:
+        return True
+    return len(str(text).strip()) < 200
 
 
 def _supports(fn, param: str) -> bool:
@@ -259,6 +285,12 @@ def resolve_model_string(client, model_str: str) -> str:
         matches = [v for k, v in name_map.items() if "flash-lite" in k.lower() or "lite" in k.lower()]
         if matches: return matches[0]
         return dict(_LITE_MODEL_DICT)
+    # Web picker name for "Everyday help" (4 Hydrogen): not a registered
+    # WebAPI model name. Accept it and use the registry's default (the
+    # account's auto model — the same default a bare run uses), instead of
+    # passing an unknown name to generate_content.
+    if q.replace("-", " ") in _HYDROGEN_NAMES and len(name_map) == 1:
+        return next(iter(name_map.values()))
     # No live-registry match: the server no longer registers the old
     # gemini-3-* names (live-verified 2026-11-14: the registry lists only
     # "gemini-自動"). Fall back to the Model enum — the library maps it
@@ -850,10 +882,10 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         p.add_argument("-c", "--conversation", metavar="FILE", help="Conversation state file")
         p.add_argument("--new", action="store_true", dest="new_conv", help="Start fresh")
         # Model
-        p.add_argument("-m", "--model", choices=["flash","pro","thinking","lite"],
-                       help="Model: flash, pro, thinking, lite")
-        p.add_argument("--thinking", choices=["standard","plus","extended"],
-                       help="Thinking tier")
+        p.add_argument("-m", "--model", choices=["flash","pro","thinking","lite","hydrogen","flash-lite"],
+                       help="Model: flash, pro, thinking, lite, hydrogen (web default), flash-lite")
+        p.add_argument("--thinking", choices=["standard","plus","extended","low","medium","high"],
+                       help="Thinking tier: standard/low, plus/medium, extended/high")
         # Image gen
         p.add_argument("--img-gen", action="store_true", dest="image_gen", help="Force image gen")
         p.add_argument("--img", dest="image_prompt", metavar="PROMPT", help="Generate image")
@@ -1648,6 +1680,12 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                             if model: kwargs["model"] = model
                             response = await asyncio.wait_for(
                                 self.client.generate_content(**kwargs), timeout=actual_timeout)
+                            if _dr_is_stub(getattr(response, "text", None)):
+                                fail("DR_FAILED",
+                                     "Deep research plan creation failed and the fallback "
+                                     "returned no report. The account/session may not "
+                                     "support deep research on this build.",
+                                     {"retry": False})
                 else:
                     kwargs = {"prompt": prompt}
                     if all_files: kwargs["files"] = all_files
