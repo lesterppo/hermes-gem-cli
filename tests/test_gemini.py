@@ -226,6 +226,8 @@ class TestModelResolution(unittest.TestCase):
 
     def test_thinking_level_web_names(self):
         # Web picker "Thinking level": Low / Medium / High.
+        if g.GeminiModel is None:
+            self.skipTest("gemini-webapi not importable here")
         self.assertEqual(g.resolve_model_enum("flash", "high").name, "ADVANCED_FLASH")
         self.assertEqual(g.resolve_model_enum("flash", "low").name, "BASIC_FLASH")
         self.assertEqual(g.resolve_model_enum("pro", "medium").name, "PLUS_PRO")

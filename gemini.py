@@ -253,7 +253,7 @@ def resolve_model_enum(model_str: str | None, thinking: str | None = None):
     if mtype == "LITE": return dict(_LITE_MODEL_DICT)
     if tier:
         try: return GeminiModel[f"{tier}_{mtype}"]
-        except KeyError: return model_str
+        except (KeyError, TypeError): return model_str
     return model_str
 
 def resolve_model_string(client, model_str: str) -> str:
@@ -300,7 +300,7 @@ def resolve_model_string(client, model_str: str) -> str:
     if mtype is not None:
         try:
             return GeminiModel[f"BASIC_{mtype}"]
-        except (AttributeError, KeyError):
+        except (AttributeError, KeyError, TypeError):
             pass
     return model_str
 
