@@ -542,7 +542,13 @@ class _MediaJsonProxy:
         return self._real.dumps(obj, *args, **kwargs)
 
 def _install_media_proxy():
-    import gemini_webapi.client as _gclient
+    # No-op when the library is absent (CI installs pytest only): the
+    # media proxy only matters for a real library call, and
+    # _generate_media's unit tests run with a fake client.
+    try:
+        import gemini_webapi.client as _gclient
+    except ImportError:
+        return
     if not isinstance(_gclient.json, _MediaJsonProxy):
         _gclient.json = _MediaJsonProxy(_gclient.json)
 
