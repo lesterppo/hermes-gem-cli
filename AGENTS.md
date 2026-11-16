@@ -102,6 +102,12 @@ default; no Hydrogen name is exposed via WebAPI).
 -m flash-lite                   → lite+standard (web name for 3.5 Flash-Lite)
 -m hydrogen                     → auto (web name for 4 Hydrogen; WebAPI has
                                   no Hydrogen name, resolves to the default)
+-m hydrogen --thinking high     → auto + extended_thinking (fixed 2026-11-16:
+                                  Hydrogen has no Model-enum variant, so the
+                                  high tier is carried as the library's
+                                  extended_thinking flag, not an enum;
+                                  before the fix this failed GEN_FAILED
+                                  "Unknown model name: 'hydrogen'")
 -m thinking                     → FAILS FAST (GEN_FAILED: no *THINKING
                                   member in gemini-webapi 2.1.1's Model enum)
 --thinking low / medium / high  → standard / plus / extended (web Thinking level)

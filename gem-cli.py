@@ -463,6 +463,37 @@ def resolve_model_string(client, model_str: str) -> str:
             pass
     return model_str
 
+
+def resolve_model(client, model_str: str | None, thinking: str | None = None):
+    """Resolve -m/--thinking to (model, extended_thinking) for generate_content.
+
+    `model` is whatever generate_content accepts (a Model enum, a registered
+    name string, or None). `extended_thinking` is True only when the caller
+    asked for the high/extended tier on a model that has no Model-enum
+    thinking variant.
+
+    Why this exists (2026-11-16): `-m hydrogen --thinking high` failed with
+    GEN_FAILED "Unknown model name: 'hydrogen'". The thinking path went
+    through resolve_model_enum, which returns the raw string for any name
+    outside _MODEL_ALIASES — and Hydrogen is a web-picker name, not a
+    registered WebAPI model, so it has no enum variant (there is no
+    ADVANCED_HYDROGEN in gemini-webapi's Model). Fix: Hydrogen resolves to
+    the registry default (the auto model) via resolve_model_string, and the
+    high tier is carried as the library's extended_thinking flag on
+    generate_content instead of as an enum. Non-Hydrogen models keep the
+    exact enum path they had before (flash+high -> ADVANCED_FLASH, etc.).
+    """
+    if not model_str and not thinking:
+        return None, False
+    q = (model_str or "").lower().strip()
+    if q.replace("-", " ") in _HYDROGEN_NAMES and thinking:
+        tier = _THINKING_ALIASES.get(thinking.lower().strip(), thinking.upper())
+        return resolve_model_string(client, model_str), tier == "ADVANCED"
+    if thinking:
+        return resolve_model_enum(model_str, thinking), False
+    return resolve_model_string(client, model_str), False
+
+
 # ── Conversation state ──────────────────────────────────────
 
 class ChatRef:
@@ -1070,11 +1101,9 @@ Output: compact JSON pointer on stdout, full response on disk.""")
 
         # ── Model resolution ──
         model = None
+        extended_thinking = False
         if args.model or args.thinking:
-            if args.thinking:
-                model = resolve_model_enum(args.model, args.thinking)
-            else:
-                model = resolve_model_string(self.client, args.model)
+            model, extended_thinking = resolve_model(self.client, args.model, args.thinking)
 
         # Try to get Gem name
         gem_name = ""
@@ -1303,6 +1332,8 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                         kwargs["chat"] = ChatRef(chat_metadata)
                     if model:
                         kwargs["model"] = model
+                    if extended_thinking and _supports(self.client.generate_content, "extended_thinking"):
+                        kwargs["extended_thinking"] = True
                     kwargs["gem"] = gem_id
                     if args.deep_research:
                         kwargs["deep_research"] = True

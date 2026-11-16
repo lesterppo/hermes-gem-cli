@@ -235,6 +235,37 @@ class TestModelResolution(unittest.TestCase):
         self.assertEqual(g.resolve_model_enum("flash", "low").name, "BASIC_FLASH")
         self.assertEqual(g.resolve_model_enum("pro", "medium").name, "PLUS_PRO")
 
+    def test_hydrogen_with_thinking_resolves_to_auto_plus_extended_flag(self):
+        # Regression (2026-11-16): `-m hydrogen --thinking high` failed with
+        # GEN_FAILED "Unknown model name: 'hydrogen'" because the thinking
+        # path went through resolve_model_enum, which returns the raw string
+        # for names outside _MODEL_ALIASES. Hydrogen has no enum variant, so
+        # it must resolve to the registry default and carry the high tier as
+        # the library's extended_thinking flag instead.
+        if g.GeminiModel is None:
+            self.skipTest("gemini-webapi not importable here")
+        model, ext = g.resolve_model(self._auto_only(), "hydrogen", "high")
+        self.assertEqual(model, "gemini-自動")
+        self.assertTrue(ext)
+        model, ext = g.resolve_model(self._auto_only(), "hydrogen", "low")
+        self.assertEqual(model, "gemini-自動")
+        self.assertFalse(ext)
+        model, ext = g.resolve_model(self._auto_only(), "4 hydrogen", "extended")
+        self.assertEqual(model, "gemini-自動")
+        self.assertTrue(ext)
+
+    def test_resolve_model_keeps_enum_path_for_flash(self):
+        # Non-Hydrogen models must keep the exact enum path they had before.
+        if g.GeminiModel is None:
+            self.skipTest("gemini-webapi not importable here")
+        model, ext = g.resolve_model(self._auto_only(), "flash", "high")
+        self.assertEqual(model.name, "ADVANCED_FLASH")
+        self.assertFalse(ext)
+        model, ext = g.resolve_model(self._auto_only(), "flash", None)
+        self.assertEqual(model.name, "BASIC_FLASH")
+        self.assertFalse(ext)
+        self.assertEqual(g.resolve_model(None, None), (None, False))
+
 
 class TestStdinRead(unittest.TestCase):
     """_read_stdin_if_piped must not hang forever on an open pipe.
