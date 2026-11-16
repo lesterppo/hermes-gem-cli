@@ -14,6 +14,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("gemini", ROOT / "gemini.py")
@@ -278,6 +279,37 @@ class TestDrStub(unittest.TestCase):
                                       "Let me know if you need to make changes."))
         self.assertFalse(g._dr_is_stub("x" * 200))
         self.assertFalse(g._dr_is_stub("## Report\n\n" + "detail. " * 100))
+
+
+class TestDrReportText(unittest.TestCase):
+    """The finished report is the attached document, not the reply notice
+    (live 2026-11-16: 91-char notice vs 28,225-char document). The run path
+    must prefer the document or it fails a run that worked."""
+
+    def _doc(self, content):
+        return SimpleNamespace(content=content, title="T", id="im_x",
+                               sources=[1, 2])
+
+    def test_prefers_document_on_result(self):
+        doc = self._doc("## Report\n\n" + "detail. " * 100)
+        result = SimpleNamespace(document=doc,
+                                 text="I've completed your research.")
+        self.assertEqual(g._dr_report_text(result), doc.content)
+
+    def test_prefers_document_on_model_output(self):
+        doc = self._doc("## Report\n\n" + "detail. " * 100)
+        out = SimpleNamespace(deep_research_document=doc,
+                              text="I've completed your research.")
+        self.assertEqual(g._dr_report_text(out), doc.content)
+
+    def test_falls_back_to_reply_text(self):
+        out = SimpleNamespace(text="plain reply " * 30)
+        self.assertEqual(g._dr_report_text(out), "plain reply " * 30)
+
+    def test_empty_document_falls_back(self):
+        out = SimpleNamespace(deep_research_document=self._doc(""),
+                              text="reply text " * 30)
+        self.assertEqual(g._dr_report_text(out), "reply text " * 30)
 
 
 class TestSupports(unittest.TestCase):

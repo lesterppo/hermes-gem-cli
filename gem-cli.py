@@ -185,6 +185,40 @@ def _dr_is_stub(text) -> bool:
     return len(str(text).strip()) < 200
 
 
+def _dr_report_text(obj) -> str | None:
+    """Best report text for a deep-research result.
+
+    Live 2026-11-16 (chat c_5e9dd188fd4c5e5b): Gemini delivers the finished
+    report as an immersive document attached to the turn; the reply text is
+    only a short notice ("I've completed your research", 91 chars). The run
+    path used to feed that notice to the DR_FAILED stub guard and fail a run
+    that had actually produced a report — a CLI extraction miss, not a
+    server failure. Prefer the document: gemini-webapi 2.1.1's
+    DeepResearchResult carries it as .document (and its .text already prefers
+    it); a ModelOutput carries it as .deep_research_document. Reply text is
+    only the fallback for a run that produced no document.
+    """
+    try:
+        doc = getattr(obj, "document", None)  # DeepResearchResult
+        if doc is not None and getattr(doc, "content", ""):
+            return doc.content
+    except Exception:
+        pass
+    try:
+        doc = getattr(obj, "deep_research_document", None)  # ModelOutput
+        if doc is not None and getattr(doc, "content", ""):
+            return doc.content
+    except Exception:
+        pass
+    try:
+        t = getattr(obj, "text", None)
+        if isinstance(t, str) and t.strip():
+            return t
+    except Exception:
+        pass
+    return None
+
+
 def _load_auth_cache() -> tuple[str | None, str | None]:
     """Tier 2: read cached tokens from ~/.gemini-cli/auth.json."""
     try:
@@ -1214,6 +1248,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             if attempt > 0:
                 self.log(f"Retry {attempt + 1}/{max_attempts}...")
 
+            dr_report = None  # deep-research report text (document, not reply notice)
             try:
                 if args.deep_research:
                     # Deep research: create plan → start → wait for results
@@ -1259,6 +1294,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                         timeout=actual_timeout,
                     )
                     response = result.final_output
+                    dr_report = _dr_report_text(result)
                 else:
                     kwargs = {"prompt": prompt}
                     if all_files:
@@ -1310,6 +1346,10 @@ Output: compact JSON pointer on stdout, full response on disk.""")
 
             # Success — process response
             text = response.text
+            if args.deep_research and dr_report:
+                # The report is the attached document, not the reply notice;
+                # without this the stub guard below fails a run that worked.
+                text = dr_report
             if args.deep_research and _dr_is_stub(text):
                 fail("DR_FAILED",
                      "Deep research returned no report (plan creation failed and the "

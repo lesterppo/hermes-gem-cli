@@ -236,6 +236,39 @@ def _dr_is_stub(text) -> bool:
     return len(str(text).strip()) < 200
 
 
+def _dr_report_text(obj) -> str | None:
+    """Best report text for a deep-research result.
+
+    Live 2026-11-16 (chat c_5e9dd188fd4c5e5b): Gemini delivers the finished
+    report as an immersive document attached to the turn; the reply text is
+    only a short notice ("I've completed your research", 91 chars). The run
+    path used to report that notice as ok:true with s=91 — a CLI extraction
+    miss, not a server failure. Prefer the document: gemini-webapi 2.1.1's
+    DeepResearchResult carries it as .document (and its .text already prefers
+    it); a ModelOutput carries it as .deep_research_document. Reply text is
+    only the fallback for a run that produced no document.
+    """
+    try:
+        doc = getattr(obj, "document", None)  # DeepResearchResult
+        if doc is not None and getattr(doc, "content", ""):
+            return doc.content
+    except Exception:
+        pass
+    try:
+        doc = getattr(obj, "deep_research_document", None)  # ModelOutput
+        if doc is not None and getattr(doc, "content", ""):
+            return doc.content
+    except Exception:
+        pass
+    try:
+        t = getattr(obj, "text", None)
+        if isinstance(t, str) and t.strip():
+            return t
+    except Exception:
+        pass
+    return None
+
+
 def _supports(fn, param: str) -> bool:
     """True when a library callable accepts `param` (lib versions drift)."""
     try:
@@ -1601,14 +1634,23 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                     fail("RESEARCH_STATUS_FAILED", f"No turn found for chat {cid}")
                 doc = getattr(out, "deep_research_document", None)
                 text = out.text or ""
-                done = bool(doc) or len(text) > 400
+                # The finished report is the attached document, not the reply
+                # text (a short notice, ~91 chars). Write the document when
+                # present; a document container with empty content means the
+                # research is still running, not done.
+                body = (doc.content if doc and getattr(doc, "content", "") else text)
+                done = bool(doc and getattr(doc, "content", "")) or len(text) > 400
                 res = {"ok": True, "cid": cid,
                        "status": "completed" if done else "pending",
-                       "chars": len(text), "has_document": bool(doc)}
-                if done and text:
+                       "chars": len(body), "has_document": bool(doc)}
+                if doc:
+                    res["doc_title"] = doc.title
+                    res["doc_id"] = doc.id
+                    res["sources"] = len(doc.sources or [])
+                if done and body:
                     op = Path(args.output) if args.output else Path(
                         f"/tmp/gemini-dr-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md")
-                    op.write_text(text, encoding="utf-8")
+                    op.write_text(body, encoding="utf-8")
                     res["f"] = str(op)
                 print(json.dumps(res, ensure_ascii=False))
             except (SystemExit,):
@@ -1941,6 +1983,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         max_attempts = 1 if (args.no_retry or gem_unresolved or direct_chat) else 3
         for attempt in range(max_attempts):
             if attempt > 0: self.log(f"Retry {attempt+1}/{max_attempts}...")
+            dr_report = None  # deep-research report text (document, not reply notice)
             try:
                 if args.deep_research:
                     self.log("Creating research plan...")
@@ -1960,6 +2003,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                             self.client.deep_research(prompt, **_dr_kwargs),
                             timeout=actual_timeout)
                         response = result.final_output
+                        dr_report = _dr_report_text(result)
                     except Exception as plan_err:
                         plan_msg = str(plan_err)
                         if "not eligible" in plan_msg.lower() or "rejected" in plan_msg.lower():
@@ -2000,6 +2044,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                                 self.client.wait_for_deep_research(plan, **_wfw_kwargs),
                                 timeout=actual_timeout)
                             response = result.final_output
+                            dr_report = _dr_report_text(result)
                         except Exception as manual_err:
                             # Last resort: generate_content with deep_research=True
                             self.log(f"Manual plan failed, trying direct mode: {manual_err}")
@@ -2007,7 +2052,8 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                             if model: kwargs["model"] = model
                             response = await asyncio.wait_for(
                                 self.client.generate_content(**kwargs), timeout=actual_timeout)
-                            if _dr_is_stub(getattr(response, "text", None)):
+                            dr_report = _dr_report_text(response)
+                            if _dr_is_stub(dr_report):
                                 fail("DR_FAILED",
                                      "Deep research plan creation failed and the fallback "
                                      "returned no report. The account/session may not "
@@ -2124,6 +2170,20 @@ Output: compact JSON pointer on stdout, full response on disk.""")
 
             # Success
             text = response.text
+            if args.deep_research:
+                # The report is the attached document, not the reply notice.
+                if dr_report:
+                    text = dr_report
+                # The high-level/manual paths had no stub guard: a run that
+                # finishes with only the notice and no document must fail
+                # DR_FAILED, not report ok:true with a ~91-byte stub.
+                if _dr_is_stub(text):
+                    fail("DR_FAILED",
+                         "Deep research finished but produced no report (the reply "
+                         "was only a short notice and no document was attached). "
+                         "The account/session may not support deep research on "
+                         "this build.",
+                         {"retry": False})
             new_meta = list(response.metadata) if response.metadata else None
 
             # Images / Videos / Media / Thoughts

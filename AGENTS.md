@@ -155,6 +155,19 @@ fallback returns only a stub (<200 chars), both CLIs fail `DR_FAILED`
 instead of reporting `ok:true`. `--deep-research` without a Gem runs
 direct (gem-less) since the 4.4 fix.
 
+Live correction 2026-11-16: the finished report is an immersive document
+attached to the turn, NOT the reply text — the reply is only a short notice
+("I've completed your research", ~91 chars). The run path used to report
+that notice as `ok:true` (gemini.py) or fail `DR_FAILED` on it (gem-cli.py)
+even when the report existed. Both CLIs now read the document via
+`_dr_report_text` (DeepResearchResult `.document` / ModelOutput
+`.deep_research_document`, reply text only as fallback), and
+`--deep-research-status` writes the document to its file instead of the
+notice. Live-verified: Hydrogen report 28,225 chars / 38 sources
+(chat c_5e9dd188fd4c5e5b) and a fresh Carbon run 29,720 chars, both via the
+fixed run path. A run that finishes with only the notice and no document
+still fails `DR_FAILED`.
+
 ## Live server behaviours (verified 2026-11-14)
 
 - `--list-chats` fails `LIST_CHATS_FAILED` when Gemini Activity is off:
