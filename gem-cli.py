@@ -11,6 +11,7 @@ Usage:
   gem-cli <gem-url> -f report.pdf "summarize"           # file upload
   gem-cli <gem-url> -i chart.png "analyze"              # image upload
   gem-cli <gem-url> -m pro --thinking extended "..."    # model/thinking
+  gem-cli <gem-url> --show-thoughts -m flash --thinking extended "..."  # include chain of thought
   gem-cli <gem-url> --img "a cat flying"                # image generation
   gem-cli --video "a puppy in a sunny field"             # video generation (Veo)
   gem-cli --music "upbeat electronic track"              # music generation (Lyria)
@@ -214,6 +215,36 @@ def _dr_report_text(obj) -> str | None:
         t = getattr(obj, "text", None)
         if isinstance(t, str) and t.strip():
             return t
+    except Exception:
+        pass
+    return None
+
+
+def _extract_thoughts(response) -> str | None:
+    """Chain of thought for a generate response, or None.
+
+    gemini-webapi 2.1.1 parses the model's thinking trace from the raw
+    candidate (`candidate_data[37][0][0]`) onto
+    `ModelOutput.thoughts` (chosen candidate's `.thoughts`). It is only
+    populated for thinking models/tiers — a plain flash/pro reply, or a
+    turn whose trace the server withheld, returns None, which is not an
+    error. Mirrors gemini.py's `response.thoughts` read, with a
+    candidates-list fallback in case the `.thoughts` property itself
+    raises (e.g. an empty candidates list on a malformed turn).
+    """
+    try:
+        t = getattr(response, "thoughts", None)
+        if isinstance(t, str) and t.strip():
+            return t
+    except Exception:
+        pass
+    try:
+        cands = getattr(response, "candidates", None) or []
+        chosen = getattr(response, "chosen", 0) or 0
+        if 0 <= chosen < len(cands):
+            t = getattr(cands[chosen], "thoughts", None)
+            if isinstance(t, str) and t.strip():
+                return t
     except Exception:
         pass
     return None
@@ -732,6 +763,7 @@ class GemCLI:
 
     def pointer(self, out_path: Path, conv_state: dict | None = None,
                 images: list | None = None, code_blocks: int = 0,
+                thoughts: bool = False,
                 model_label: str = "", gem_name: str = "", deep_research: bool = False):
         """Emit compact pointer JSON to stdout."""
         p = {"ok": True, "f": self._short_path(out_path), "s": out_path.stat().st_size}
@@ -739,6 +771,8 @@ class GemCLI:
             p["b"] = code_blocks
         if images:
             p["imgs"] = len(images)
+        if thoughts:
+            p["thoughts"] = True
         if model_label:
             p["model"] = model_label
         if gem_name:
@@ -832,6 +866,11 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                             help="Write .json output instead of .md")
         parser.add_argument("--brief", action="store_true",
                             help="Prepend 'Be concise.' to prompt")
+        parser.add_argument("--show-thoughts", action="store_true",
+                            help="Include the model's chain of thought in output "
+                            "('thoughts' in --json-out, '## Thoughts' in .md, "
+                            "thoughts:true in the pointer; only populated for "
+                            "thinking models/tiers)")
         parser.add_argument("-q", "--quiet", action="store_true",
                             help="Suppress stderr logs")
         parser.add_argument("--raw", action="store_true", dest="raw_mode",
@@ -1396,6 +1435,14 @@ Output: compact JSON pointer on stdout, full response on disk.""")
             except Exception:
                 pass
 
+            # Chain of thought (gemini-webapi ModelOutput.thoughts).
+            # Extracted for every response, like gemini.py: --json-out
+            # stores it whenever present, --show-thoughts controls the
+            # .md rendering and the pointer flag. None is normal for
+            # non-thinking models/tiers, not an error.
+            thoughts_text = _extract_thoughts(response)
+            has_thoughts = bool(thoughts_text)
+
             # Update conversation
             if args.conversation and new_meta:
                 conv_state["cid"] = new_meta[0]
@@ -1412,12 +1459,20 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 payload = {"ok": True, "text": text, "model": model_label}
                 if images_out:
                     payload["images"] = images_out
+                if has_thoughts:
+                    payload["thoughts"] = thoughts_text
+                elif args.show_thoughts:
+                    self.log("No thoughts returned — model may not provide thinking traces for this prompt/tier.")
                 if conv_state:
                     payload["conversation"] = conv_state
                 out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                                     encoding="utf-8")
             else:
                 out_text = text
+                if has_thoughts and args.show_thoughts:
+                    out_text += "\n\n## Thoughts\n\n" + thoughts_text
+                elif args.show_thoughts and not has_thoughts:
+                    self.log("No thoughts returned — model may not provide thinking traces for this prompt/tier.")
                 if images_out:
                     out_text += "\n\n## Generated Images\n\n"
                     for i, img in enumerate(images_out):
@@ -1442,6 +1497,7 @@ Output: compact JSON pointer on stdout, full response on disk.""")
                 return
             
             self.pointer(out_path, conv_state, images_out, len(code_blocks),
+                        thoughts=has_thoughts,
                         model_label=model_label, gem_name=gem_name,
                         deep_research=args.deep_research)
             return

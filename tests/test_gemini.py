@@ -22,6 +22,22 @@ g = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(g)
 
 
+def _load_cli():
+    """Load gem-cli.py as a second module (None when gemini-webapi is
+    absent — gem-cli.py exits DEP_MISSING on import without it, unlike
+    gemini.py which degrades; the thoughts tests skip in that case)."""
+    spec_cli = importlib.util.spec_from_file_location("gem_cli", ROOT / "gem-cli.py")
+    cli = importlib.util.module_from_spec(spec_cli)
+    try:
+        spec_cli.loader.exec_module(cli)
+    except (SystemExit, ImportError):
+        return None
+    return cli
+
+
+CLI = _load_cli()
+
+
 def _jar(sid, ts=None, n=25):
     jar = {"__Secure-1PSID": sid, "SAPISID": "sap", "SID": "sid",
            "__Secure-1PAPISID": "pap"}
@@ -161,6 +177,62 @@ class TestArgSurface(unittest.TestCase):
         self.assertIn("reversed(history.turns)", src)
         self.assertIn("reversed(pairs)", src)
         self.assertIn('"order": "oldest-first"', src)
+
+
+class TestThoughtsExtraction(unittest.TestCase):
+    """--show-thoughts in gem-cli.py: chain of thought comes from
+    gemini-webapi's ModelOutput.thoughts (candidate_data[37][0][0]),
+    the same source gemini.py reads. None is normal for non-thinking
+    models/tiers, not an error."""
+
+    def setUp(self):
+        if CLI is None:
+            self.skipTest("gem-cli.py needs gemini-webapi installed")
+
+    def test_extracts_thoughts_from_model_output(self):
+        resp = SimpleNamespace(thoughts="Step 1: parse the question.\nStep 2: answer.")
+        self.assertEqual(CLI._extract_thoughts(resp),
+                         "Step 1: parse the question.\nStep 2: answer.")
+
+    def test_none_when_no_thoughts(self):
+        self.assertIsNone(CLI._extract_thoughts(SimpleNamespace(thoughts=None)))
+        self.assertIsNone(CLI._extract_thoughts(SimpleNamespace()))
+
+    def test_blank_thoughts_is_none(self):
+        self.assertIsNone(CLI._extract_thoughts(SimpleNamespace(thoughts="   \n")))
+
+    def test_candidates_fallback_when_thoughts_property_raises(self):
+        class _BrokenOutput:
+            candidates = [SimpleNamespace(thoughts="fallback trace")]
+            chosen = 0
+
+            @property
+            def thoughts(self):
+                raise RuntimeError("no candidates")
+
+        self.assertEqual(CLI._extract_thoughts(_BrokenOutput()), "fallback trace")
+
+    def test_show_thoughts_flag_present(self):
+        self.assertIn('"--show-thoughts"', inspect.getsource(CLI))
+
+    def test_pointer_emits_thoughts_flag(self):
+        import io
+        import contextlib
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tf:
+            tf.write(b"answer")
+            path = Path(tf.name)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                CLI.GemCLI().pointer(path, thoughts=True)
+            self.assertTrue(json.loads(buf.getvalue())["thoughts"])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                CLI.GemCLI().pointer(path, thoughts=False)
+            self.assertNotIn("thoughts", json.loads(buf.getvalue()))
+        finally:
+            path.unlink(missing_ok=True)
 
 
 class TestModelResolution(unittest.TestCase):
