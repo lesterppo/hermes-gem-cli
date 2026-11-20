@@ -1,0 +1,4 @@
+[gemini] warning: no live-session credential found — using the first available pair (chat may work; Gem/read APIs will fail)
+[gemini] model=flash+extended
+[gemini] Direct chat (no Gem): probing with a 60s cap — raise with -t
+[gemini] No thoughts returned — model may not provide thinking traces for this prompt/tier (deep research often does).

@@ -1015,7 +1015,9 @@ Output: compact JSON pointer on stdout, full response on disk.""")
         # parse_intermixed_args dumps all positionals into args.url first:
         # a sentence-like positional is prompt text, not a Gem URL. Merge
         # it back into args.prompt (same rule as gemini.py) so a bare
-        # prompt without a Gem runs direct instead of BAD_URL.
+        # prompt without a Gem fails NO_URL (not BAD_URL) unless a
+        # standalone mode (--img/--deep-research/--video/--music/--resume)
+        # is given. gemini.py runs bare prompts direct; gem-cli.py does not.
         if args.url and not args.prompt_flag \
                 and not (args.url.startswith(("http://", "https://"))
                          or re.fullmatch(r"[A-Za-z0-9_-]{5,20}", args.url or "")):

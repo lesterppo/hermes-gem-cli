@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import matrix_part1 as dm
 
 PY, GEM, CLI = dm.PY, dm.GEM, dm.CLI
-OUT = os.path.join(ROOT, "tests", "live", "results", "part3.jsonl")
+OUT = os.path.join(dm.ROOT, "tests", "live", "results", "part3.jsonl")
 results = []
 
 
@@ -98,6 +98,76 @@ p, s = sh([PY, CLI, "coding-partner", "-m", "flash", "--thinking", "extended",
            "--no-retry", "-t", "60", "-o", "/tmp/d_cli_thi.md", PROMPT])
 ok, note = file_ok("/tmp/d_cli_thi.md", "Paris")
 rec("cli-thinking-extended", ok, s, note, ptr_of(p))
+
+# cli --show-thoughts (2026-11-20, HEAD 14851b4): chain-of-thought
+# extraction in gem-cli.py. A reasoning prompt is required — the
+# one-word Paris prompt yields no trace. PASS only if the file carries
+# a real "## Thoughts" section (non-trivial trace, distinct from the
+# answer) AND the pointer has thoughts:true.
+# NOTE (2026-11-20 rerun): the original sqrt(2) prompt is refused by
+# the coding-partner Gem ("math proofs are outside my scope"), so the
+# model never reasons and no trace can exist. Use a coding reasoning
+# prompt the Gem will actually answer. Even so, the server currently
+# sends an EMPTY thoughts slot (candidate_data[37] == []) for chat
+# turns on this account — verified by a raw library probe — so a
+# non-empty trace is not achievable live here; the case records that
+# honestly instead of passing on an empty trace.
+COT_PROMPT = ("Explain step by step how you would prove that binary search "
+              "on a sorted list runs in O(log n) time, then write a Python "
+              "implementation with comments showing each step of your reasoning.")
+COT_OUT = os.path.join(dm.ROOT, "tests", "live", "results", "cli_show_thoughts_2026-11-20.md")
+p, s = sh([PY, CLI, "coding-partner", "-m", "flash", "--thinking", "extended",
+           "--show-thoughts", "--no-retry", "-t", "180", "-o", COT_OUT, COT_PROMPT])
+ptr = ptr_of(p)
+cot_ok, cot_note = False, "no output file"
+if p is not None and os.path.exists(COT_OUT):
+    txt = open(COT_OUT, encoding="utf-8", errors="ignore").read()
+    if "## Thoughts" in txt:
+        answer, _, trace = txt.partition("## Thoughts")
+        trace = trace.strip()
+        cot_ok = len(trace) >= 100 and len(answer.strip()) > 0 and trace[:80] not in answer
+        cot_note = f"trace={len(trace)} chars, file={os.path.getsize(COT_OUT)}B"
+    else:
+        cot_note = f"no ## Thoughts section, file={os.path.getsize(COT_OUT)}B"
+elif p is None:
+    cot_note = "timed out after 180s"
+rec("cli-show-thoughts",
+    cot_ok and bool(ptr and ptr.get("thoughts") is True), s,
+    cot_note + f" | ptr thoughts={(ptr or {}).get('thoughts')}", ptr)
+
+# Control (a): --json-out WITHOUT --show-thoughts — the .json must
+# still carry a "thoughts" field (stored whenever present, gemini.py
+# parity).
+COT_JSON = os.path.join(dm.ROOT, "tests", "live", "results", "cli_show_thoughts_2026-11-20.json")
+p, s = sh([PY, CLI, "coding-partner", "-m", "flash", "--thinking", "extended",
+           "--json-out", "--no-retry", "-t", "180", "-o", COT_JSON, COT_PROMPT])
+ptr = ptr_of(p)
+j_ok, j_note = False, "no output file"
+if p is not None and os.path.exists(COT_JSON):
+    try:
+        data = json.load(open(COT_JSON, encoding="utf-8"))
+        t = data.get("thoughts")
+        j_ok = isinstance(t, str) and len(t.strip()) >= 100
+        j_note = f"thoughts={len(t) if isinstance(t, str) else 0} chars"
+    except Exception as e:
+        j_note = f"unparsable json: {e}"
+elif p is None:
+    j_note = "timed out after 180s"
+rec("cli-show-thoughts-json-out", j_ok, s, j_note, ptr)
+
+# Control (b): plain flash (no thinking tier) with --show-thoughts —
+# expect NO thoughts:true in the pointer and a stderr note. A missing
+# trace on a non-thinking model is normal, so that outcome is a PASS.
+p, s = sh([PY, CLI, "coding-partner", "-m", "flash",
+           "--show-thoughts", "--no-retry", "-t", "120",
+           "-o", "/tmp/d_cli_plain_thoughts.md", COT_PROMPT])
+ptr = ptr_of(p)
+b_ok = bool(p is not None and ptr and ptr.get("ok") is True
+            and not ptr.get("thoughts")
+            and "No thoughts returned" in p.stderr)
+rec("cli-show-thoughts-plain-flash", b_ok, s,
+    f"ptr thoughts={(ptr or {}).get('thoughts')} | stderr note={'No thoughts returned' in (p.stderr if p else '')}",
+    ptr)
 p, s = sh([PY, CLI, "coding-partner", "--brief", "--no-retry", "-t", "60",
            "-o", "/tmp/d_cli_brief.md", PROMPT])
 ok, note = file_ok("/tmp/d_cli_brief.md", "Paris")

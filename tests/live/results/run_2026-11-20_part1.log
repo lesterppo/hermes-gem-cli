@@ -1,0 +1,25 @@
+PASS doctor (10.5s) 
+PASS account-status (9.4s) 
+PASS list-models (5.7s) 
+PASS list-gems (9.1s) 
+PASS list-chats (3.6s) 
+PASS gem-info (6.3s) 
+PASS gem-flash (12.1s) /tmp/d_flash.md 5B
+PASS gem-pro (11.1s) /tmp/d_pro.md 5B
+FAIL gem-lite (12.9s) /tmp/d_lite.md lacks 'Paris'
+PASS gem-hydrogen (12.6s) /tmp/d_hyd.md 5B
+PASS gem-flash-lite (11.9s) /tmp/d_fl.md 5B
+PASS gem-thinking-failfast (7.2s) expected fail GEN_FAILED
+FAIL gem-thinking-high (12.6s) /tmp/d_thi.md lacks 'Paris'
+PASS direct (11.4s) /tmp/d_direct.md 5B
+PASS direct-open-pipe (30.0s) /tmp/d_pipe.md 5B
+PASS brief (10.8s) /tmp/d_brief.md 5B
+PASS json-out (11.6s) /tmp/d_json.md 57B
+PASS raw-stderr-empty (12.8s) 
+PASS temporary (16.6s) /tmp/d_tmp.md 5B
+PASS stream (11.1s) /tmp/d_stream.md 5B
+FAIL gem-flag (11.8s) /tmp/d_gflag.md lacks 'Paris'
+PASS bad-gem-id (67.2s) expected fail TIMEOUT
+PASS no-prompt (0.4s) expected fail NO_PROMPT
+PASS timeout-soft (11.4s) /tmp/d_tsoft.md 5B
+== 21/24 passed ==

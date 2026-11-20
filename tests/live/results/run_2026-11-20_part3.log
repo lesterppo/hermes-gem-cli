@@ -1,0 +1,23 @@
+FAIL quiet (15.1s) lacks 'Paris' | stderr clean
+PASS new-flag (12.9s) 5B
+FAIL show-thoughts (15.1s) lacks 'Paris'
+PASS list-gems-limit (7.1s) n=2
+PASS browser-firefox (6.1s) no firefox cookies; falls back to cached credential, as designed
+FAIL cli-thinking-extended (10.3s) lacks 'Paris'
+FAIL cli-show-thoughts (10.7s) no ## Thoughts section, file=395B | ptr thoughts=None
+FAIL cli-show-thoughts-json-out (11.1s) thoughts=0 chars
+PASS cli-show-thoughts-plain-flash (10.6s) ptr thoughts=None | stderr note=True
+PASS cli-brief (11.7s) 5B
+FAIL cli-quiet (11.1s) lacks 'Paris'
+PASS cli-gem-info (5.6s) 
+PASS cli-list-models (4.7s) 
+PASS cli-list-gems (5.1s) 
+PASS cli-img-gen (30.7s) 373B
+FAIL cli-conv (10.3s) lacks 'Paris'
+PASS cli-resume (17.4s) 5B
+FAIL cli-timeout-soft (11.1s) lacks 'Paris'
+PASS cli-clear (0.4s) file gone=True
+== part3: 11/19 passed ==
+FAIL cli-show-thoughts (16.3s) no ## Thoughts section, file=5536B (Gem answered, server sent empty thoughts slot) | ptr thoughts=None
+FAIL cli-show-thoughts-json-out (16.5s) thoughts=0 chars
+PASS cli-show-thoughts-plain-flash (18.0s) ptr thoughts=None | stderr note=True

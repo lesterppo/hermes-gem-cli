@@ -187,7 +187,9 @@ still fails `DR_FAILED`.
 - `--raw` / `-q` now produce zero stderr (module-level warning prints
   are suppressed in raw mode).
 - `--img` / `--deep-research` without a Gem work in gem-cli.py (used to
-  fail `NO_URL` / `BAD_URL`); a bare prompt without a Gem runs direct.
+  fail `NO_URL` / `BAD_URL`); a bare prompt without a Gem still fails
+  `NO_URL` (live 2026-11-20) — only the standalone modes run gem-less;
+  gemini.py runs bare prompts direct.
 - Video/music: generation path added in 4.5 (`--video PROMPT` / `--music PROMPT`,
   both CLIs). The web's Create video/music modes are not exposed by
   gemini-webapi 2.1.1, so the CLI injects the media tool flag into the

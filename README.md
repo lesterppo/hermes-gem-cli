@@ -152,8 +152,10 @@ Fixes from the deep test:
    Gemini Activity off (1041), not a degraded session.
 4. **gem-cli.py standalone modes work without a Gem.** `--img`,
    `--deep-research`, `--resume` used to fail `NO_URL` / `BAD_URL`;
-   they now run direct (gem-less), and a bare prompt merges back into
-   `args.prompt` like gemini.py. `--resume <cid>` verified live.
+   they now run direct (gem-less). A bare prompt merges back into
+   `args.prompt` but then fails `NO_URL` unless a standalone mode is
+   given (live 2026-11-20); gemini.py runs bare prompts direct.
+   `--resume <cid>` verified live.
 5. **Deep-research `on_status` crash fixed** (gem-cli.py). The ladder
    passed `on_status` to `wait_for_deep_research`, which
    gemini-webapi 2.1.1 does not accept — every DR run died with

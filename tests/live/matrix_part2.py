@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import matrix_part1 as dm
 
 PY, GEM, CLI = dm.PY, dm.GEM, dm.CLI
-OUT = os.path.join(ROOT, "tests", "live", "results", "part2.jsonl")
+OUT = os.path.join(dm.ROOT, "tests", "live", "results", "part2.jsonl")
 results = []
 
 
@@ -213,14 +213,20 @@ p, s = sh([PY, GEM, "--clear", "-c", conv2], timeout=60)
 rec("clear", bool(ptr_of(p) and ptr_of(p).get("ok")) and not os.path.exists(conv2), s,
     f"file gone={not os.path.exists(conv2)}", ptr_of(p))
 
-# ── H. deep research (validates stub guard live) + status ──
+# ── H. deep research (post-Nov-16-fix expectation: a REAL report) ──
+# Before the 2026-11-16 document-extraction fix these cases expected
+# DR_FAILED (the run returned only a ~91-byte notice). The fix reads
+# the attached report document, so a run that produces a real report
+# (ok:true + long output file) is now the PASS; a stub-only finish
+# (DR_FAILED / <200-char file) is the FAIL.
 p, s = sh([PY, GEM, "--deep-research", "-m", "pro", "--no-retry", "-t", "580",
            "-o", "/tmp/d_dr.md",
            "What is Gemini 4 Hydrogen? Summarize in 5 bullet points: announcement date, key capabilities, and how it differs from Gemini 3."],
           timeout=590)
 ptr = ptr_of(p)
-rec("deep-research-guard", bool(ptr and ptr.get("ok") is False and ptr.get("err") == "DR_FAILED"),
-    s, (ptr or {}).get("msg", ""), ptr)
+dr_ok, dr_note = file_ok("/tmp/d_dr.md", None, 1000)
+rec("deep-research", bool(ptr and ptr.get("ok") is True) and dr_ok, s,
+    f"{dr_note} | ptr={ptr}", ptr)
 p, s = sh([PY, GEM, "--deep-research-status", "fake-research-id-123"], timeout=60)
 rec("dr-status-bogus", bool(ptr_of(p) and not ptr_of(p).get("ok")), s,
     f"err={(ptr_of(p) or {}).get('err')}", ptr_of(p))
@@ -266,8 +272,9 @@ p, s = sh([PY, CLI, "--deep-research", "-m", "pro", "--no-retry", "-t", "580",
            "What is Gemini 4 Hydrogen? Summarize in 3 bullet points."],
           timeout=590)
 ptr = ptr_of(p)
-rec("cli-deep-research-guard", bool(ptr and ptr.get("ok") is False and ptr.get("err") == "DR_FAILED"),
-    s, (ptr or {}).get("msg", ""), ptr)
+cdr_ok, cdr_note = file_ok("/tmp/d_cli_dr.md", None, 1000)
+rec("cli-deep-research", bool(ptr and ptr.get("ok") is True) and cdr_ok, s,
+    f"{cdr_note} | ptr={ptr}", ptr)
 
 # ── K. soak: same Gem chat 5x ──
 soak_ok = 0

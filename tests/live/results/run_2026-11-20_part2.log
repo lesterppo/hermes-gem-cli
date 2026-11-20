@@ -1,0 +1,38 @@
+PASS gem-flag-fixed (11.7s) 5B
+FAIL raw-stderr-empty-fixed (14.4s) lacks 'Paris' | stderr empty
+FAIL list-chats-error (3.5s) 
+PASS multiturn-1 (10.6s) 30B
+PASS multiturn-2-memory (20.4s) 33B (turn 2 must reference the turn-1 variable)
+PASS resume-cid (22.7s) cid=c_eff8ba799e7ebd8b 5B
+PASS extract-code (12.6s) 31B
+PASS extract-canvas (15.4s) 262B
+PASS file-upload (14.0s) 15B
+FAIL image-upload (0s) no PNG from earlier runs to upload
+FAIL img-gen (18.4s) pngs=[]
+PASS img-gen-force (19.6s) 461B
+PASS save-media (62.2s) saved=['gemini_media_0.mp4'] (empty = model returned no audio)
+PASS save-videos (43.2s) saved=[] (empty = model returned no video)
+PASS gem-create (8.3s) id=d10acf2146d5
+PASS gem-create-listed (7.1s) 
+PASS gem-edit (9.9s) 
+PASS gem-info-after-edit (6.6s) 
+PASS gem-delete (7.7s) 
+PASS gem-delete-verified (13.6s) 
+PASS setup-search-gem (8.0s) id=63a69eba3424
+PASS setup-search-gem-cleanup (6.9s) 
+PASS delete-chat (6.7s) cid=c_5d4487c63f59bf9d
+FAIL delete-chat-verified (7.6s) read-back still returns the chat object (delete removes the history entry, not the object)
+PASS clear (0.4s) file gone=True
+FAIL deep-research (282.6s) missing /tmp/d_dr.md | ptr={'ok': False, 'err': 'DR_FAILED', 'msg': 'Deep research plan creation failed and the fallback returned no report. The account/session may not support deep research on this build.', 'retry': False}
+PASS dr-status-bogus (8.5s) err=RESEARCH_STATUS_FAILED
+PASS init-no-browser (3.5s) err=AUTH_EXPIRED
+FAIL cli-hydrogen (13.9s) lacks 'Paris'
+PASS cli-img (12.8s) 
+PASS cli-extract-code (10.8s) 31B
+PASS cli-json-out (11.6s) 54B
+PASS cli-raw-stderr-empty (12.9s) 5B | stderr empty
+PASS cli-gem-create (7.0s) id=f4a6917114c8
+PASS cli-gem-delete (6.2s) 
+FAIL cli-deep-research (590s) missing /tmp/d_cli_dr.md | ptr=None
+FAIL soak-5x-flash (0s) 2/5 Paris
+== part2: 28/37 passed ==
